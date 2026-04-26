@@ -1,0 +1,34 @@
+{
+  "name": "text-rippling",
+  "version": "0.1.0",
+  "description": "Mouse-reactive per-character text effects for the web. Zero dependencies.",
+  "main": "src/text-rippling.js",
+  "module": "src/text-rippling.mjs",
+  "browser": "src/text-rippling.js",
+  "exports": {
+    ".": {
+      "import": "./src/text-rippling.mjs",
+      "require": "./src/text-rippling.js",
+      "default": "./src/text-rippling.js"
+    }
+  },
+  "files": [
+    "src",
+    "examples"
+  ],
+  "keywords": [
+    "text",
+    "animation",
+    "ripple",
+    "mouse",
+    "cursor",
+    "interaction",
+    "typography",
+    "effect"
+  ],
+  "scripts": {
+    "dev": "npx --yes serve . -l 5173",
+    "start": "npx --yes serve . -l 5173"
+  },
+  "license": "MIT"
+}
