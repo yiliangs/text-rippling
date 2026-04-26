@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>text-rippling — mouse-reactive text effects</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;600&family=Fraunces:opsz,wght@9..144,300;9..144,800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="examples/styles.css" />
+</head>
+<body>
+  <header class="hero">
+    <div class="kicker">text-rippling</div>
+    <h1 data-effect="jelly" data-strength="48" data-radius="220">
+      Move your mouse.
+    </h1>
+    <p class="lede" data-effect="repel" data-strength="24" data-radius="140">
+      A tiny zero-dependency library for mouse-reactive per-character text effects on the web.
+    </p>
+  </header>
+
+  <section class="grid">
+    <article class="card">
+      <h2 class="label">repel</h2>
+      <div class="demo-text mono" data-effect="repel" data-strength="28" data-radius="140">
+        characters scatter away from the cursor with a soft spring return
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">attract</h2>
+      <div class="demo-text mono" data-effect="attract" data-strength="22" data-radius="160">
+        the opposite — letters lean toward your pointer like iron filings
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">jelly</h2>
+      <div class="demo-text serif" data-effect="jelly" data-strength="36" data-radius="180">
+        soft, scaling, slightly tilted — push them around
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">magnify</h2>
+      <div class="demo-text serif" data-effect="magnify" data-strength="28" data-radius="160">
+        chars under the cursor swell up, distance only scales
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">wave</h2>
+      <div class="demo-text mono" data-effect="wave" data-strength="18" data-radius="240">
+        a horizontal sine wave, modulated by cursor proximity
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">scatter</h2>
+      <div class="demo-text mono" data-effect="scatter" data-strength="34" data-radius="160">
+        each letter has a private direction; cursor controls intensity
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">swirl</h2>
+      <div class="demo-text serif" data-effect="swirl" data-strength="34" data-radius="180">
+        tangential push — letters orbit around the cursor
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">wake</h2>
+      <div class="demo-text mono" data-effect="wake" data-radius="180">
+        chars scramble and glow in the cursor's wake, fading slowly behind
+      </div>
+    </article>
+
+    <article class="card">
+      <h2 class="label">glow</h2>
+      <div class="demo-text serif" data-effect="glow" data-radius="200">
+        a soft luminous trail follows your cursor — wake without the scramble
+      </div>
+    </article>
+
+    <article class="card ripple-card">
+      <h2 class="label">ripple <span class="label-note">— the headline effect</span></h2>
+      <div class="demo-text mono ripple-text" data-effect="ripple">
+        Pudgy Penguins, a creative venture founded in 2021, quickly gained attention for its unique IP and engaging community. In 2022, the company was acquired by Igloo Inc., a strategic move aimed at expanding its reach and capabilities. The acquisition by Igloo Inc. was part of a broader vision to transform and reposition Pudgy Penguins as a next-generation entertainment company and the face of Web3 worldwide. Drag your cursor anywhere over this paragraph and watch the wake propagate as expanding wavefronts; characters flip case (or to a symbol) only at the boundary where each ripple's edge sweeps past — never inside the bright wake, never outside it.
+      </div>
+    </article>
+
+    <article class="card playground">
+      <h2 class="label">playground</h2>
+      <div class="demo-text serif" id="playground" data-effect="repel" data-strength="40" data-radius="180">
+        Tune the parameters live and feel the difference.
+      </div>
+      <div class="controls">
+        <label>effect
+          <select id="ctrl-effect">
+            <option>repel</option>
+            <option>attract</option>
+            <option>jelly</option>
+            <option>magnify</option>
+            <option>wave</option>
+            <option>scatter</option>
+            <option>swirl</option>
+            <option>wake</option>
+            <option>glow</option>
+            <option>ripple</option>
+          </select>
+        </label>
+        <label>falloff
+          <select id="ctrl-falloff">
+            <option>gaussian</option>
+            <option>linear</option>
+            <option>inverse</option>
+            <option>smooth</option>
+          </select>
+        </label>
+        <label>radius <output id="out-radius">180</output>
+          <input type="range" id="ctrl-radius" min="40" max="400" value="180" />
+        </label>
+        <label>strength <output id="out-strength">40</output>
+          <input type="range" id="ctrl-strength" min="0" max="120" value="40" />
+        </label>
+        <label>spring <output id="out-spring">0.18</output>
+          <input type="range" id="ctrl-spring" min="0.02" max="0.5" step="0.01" value="0.18" />
+        </label>
+        <label>damping <output id="out-damping">0.72</output>
+          <input type="range" id="ctrl-damping" min="0.4" max="0.95" step="0.01" value="0.72" />
+        </label>
+      </div>
+    </article>
+  </section>
+
+  <footer>
+    <code>&lt;script src="./src/text-rippling.js"&gt;&lt;/script&gt;</code>
+  </footer>
+
+  <script src="./src/text-rippling.js"></script>
+  <script>
+    // Wire any element with data-effect to a TextRippling instance,
+    // reading parameters from data-* attributes.
+    const instances = new Map();
+    for (const el of document.querySelectorAll('[data-effect]')) {
+      const opts = {
+        effect: el.dataset.effect || 'repel',
+        radius: +el.dataset.radius || 160,
+        strength: +el.dataset.strength || 30,
+        falloff: el.dataset.falloff || 'gaussian',
+      };
+      instances.set(el, new TextRippling(el, opts));
+    }
+
+    // Playground controls.
+    const pg = instances.get(document.getElementById('playground'));
+    const bind = (id, key, transform = (v) => v) => {
+      const input = document.getElementById('ctrl-' + id);
+      const out = document.getElementById('out-' + id);
+      const apply = () => {
+        const v = transform(input.value);
+        pg.update({ [key]: v });
+        if (out) out.textContent = typeof v === 'number' ? (v % 1 ? v.toFixed(2) : v) : v;
+      };
+      input.addEventListener('input', apply);
+      input.addEventListener('change', apply);
+    };
+    bind('effect', 'effect');
+    bind('falloff', 'falloff');
+    bind('radius', 'radius', (v) => +v);
+    bind('strength', 'strength', (v) => +v);
+    bind('spring', 'spring', (v) => +v);
+    bind('damping', 'damping', (v) => +v);
+  </script>
+</body>
+</html>
