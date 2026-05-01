@@ -153,13 +153,14 @@
     // where the char is already lit by other (background) hits — so swaps
     // cluster at the leading edge of the wake, not throughout it.
     //
-    // Ignores dx/dy/f. Uses page-space coords so the wake doesn't shift on scroll.
+    // Ignores dx/dy/f. All coords are page-space (the framework's canonical
+    // space) so the wake stays anchored to the document on scroll.
     ripple(dx, dy, dist, f, p, ctx) {
       const stamps = ctx.stamps;
       if (!stamps || stamps.length === 0) return REST;
 
-      const cx = ctx.charX + ctx.scrollX;
-      const cy = ctx.charY + ctx.scrollY;
+      const cx = ctx.charX;
+      const cy = ctx.charY;
       const speed = p.rippleSpeed;
       const spatial = p.rippleSpatialAtten;
       const postHit = p.ripplePostHit;
@@ -555,7 +556,6 @@
       this._baseColorRgb = null;
       this._wakeCache = null;
       this._ro = null;
-      this._onScroll = null;
 
       this._measure();
       this._bind();
@@ -581,10 +581,6 @@
     destroy() {
       AnimationLoop.remove(this);
       if (this._ro) { this._ro.disconnect(); this._ro = null; }
-      if (this._onScroll) {
-        window.removeEventListener('scroll', this._onScroll);
-        this._onScroll = null;
-      }
       this.element.innerHTML = this._originalHTML;
       this._chars = [];
     }
@@ -592,12 +588,18 @@
     // ── internals ──────────────────────────────────────────────────────
 
     _measure() {
+      // Char centers are stored in PAGE space (client + scroll). This is
+      // the framework's canonical coord space — same as CursorField stamps
+      // and `ctx.mouseX/Y`. The payoff: scrolling alone doesn't move chars
+      // in page space, so no per-scroll remeasure is needed.
+      const sx = window.scrollX || window.pageXOffset || 0;
+      const sy = window.scrollY || window.pageYOffset || 0;
       for (const c of this._chars) {
         const prev = c.el.style.transform;
         c.el.style.transform = '';
         const r = c.el.getBoundingClientRect();
-        c.hx = r.left + r.width / 2;
-        c.hy = r.top + r.height / 2;
+        c.hx = r.left + sx + r.width / 2;
+        c.hy = r.top + sy + r.height / 2;
         c.el.style.transform = prev;
       }
       // Capture base text color once. Re-read needs `color: ''` so we see
@@ -617,8 +619,8 @@
         this._ro = new ResizeObserver(() => this._measure());
         this._ro.observe(this.element);
       }
-      this._onScroll = () => this._measure();
-      window.addEventListener('scroll', this._onScroll, { passive: true });
+      // No scroll listener: positions are page-space, so scrolling
+      // doesn't change them. ResizeObserver still catches layout shifts.
     }
 
     _tick(now /*, dt */) {
@@ -660,15 +662,20 @@
   // ════════════════════════════════════════════════════════════════════
 
   function makeContext(now) {
+    // Convert the cursor sample (client-space, as the browser delivers it)
+    // into page space here so every effect sees a single coord convention
+    // — same space as `c.hx/hy` and `CursorField.stamps`. mouseVx/Vy stay
+    // as client-space deltas: that's the rate at which the user is moving
+    // the mouse, independent of scroll, which is what effects expect.
+    const sx = window.scrollX || window.pageXOffset || 0;
+    const sy = window.scrollY || window.pageYOffset || 0;
     return {
-      mouseX:  CursorField.state.x,
-      mouseY:  CursorField.state.y,
+      mouseX:  CursorField.state.x + sx,
+      mouseY:  CursorField.state.y + sy,
       mouseVx: CursorField.state.vx,
       mouseVy: CursorField.state.vy,
       time:    now,
       stamps:  CursorField.state.stamps,
-      scrollX: window.scrollX || window.pageXOffset || 0,
-      scrollY: window.scrollY || window.pageYOffset || 0,
       charX: 0, charY: 0, charSeed: 0,
     };
   }
