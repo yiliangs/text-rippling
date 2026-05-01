@@ -625,9 +625,9 @@
 
     _tick(now /*, dt */) {
       const opts = this.options;
-      const effect = resolveEffect(opts.effect);
-      const falloff = resolveFalloff(opts.falloff);
-      const picker = resolveGlyphPicker(opts.swapMode);
+      const effect  = resolve(Effects,      opts.effect,   Effects.repel);
+      const falloff = resolve(Falloffs,     opts.falloff,  Falloffs.gaussian);
+      const picker  = resolve(GlyphPickers, opts.swapMode, GlyphPickers.pool);
 
       if (!this._wakeCache) {
         const w = Color.parse(opts.wakeColor);
@@ -704,14 +704,11 @@
     return effect(dx, dy, dist, f, opts, ctx) || REST;
   }
 
-  function resolveEffect(name) {
-    return typeof name === 'function' ? name : (Effects[name] || Effects.repel);
-  }
-  function resolveFalloff(name) {
-    return typeof name === 'function' ? name : (Falloffs[name] || Falloffs.gaussian);
-  }
-  function resolveGlyphPicker(name) {
-    return typeof name === 'function' ? name : (GlyphPickers[name] || GlyphPickers.pool);
+  // Look up a strategy by name in a registry. Functions pass through so
+  // callers can hand in a custom strategy without registering it; unknown
+  // names fall back to the registry's documented default.
+  function resolve(registry, name, fallback) {
+    return typeof name === 'function' ? name : (registry[name] || fallback);
   }
 
   // ════════════════════════════════════════════════════════════════════
