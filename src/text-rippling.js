@@ -225,11 +225,11 @@
       return pool.charAt((Math.random() * pool.length) | 0);
     },
 
-    // Mostly toggle letter case (A↔a); ~25% of the time draw a symbol
+    // Mostly toggle letter case (A↔a); ~8% of the time draw a symbol
     // from `swapSymbols`. Non-letters always draw a symbol. Closer to the
     // Pudgy Penguins reference effect — feels typographic, not glitchy.
     caseFlip(originalChar, opts) {
-      if (Math.random() < 0.25) return pickSymbol(opts);
+      if (Math.random() < 0.08) return pickSymbol(opts);
       const lower = originalChar.toLowerCase();
       const upper = originalChar.toUpperCase();
       if (lower !== upper) return originalChar === upper ? lower : upper;
