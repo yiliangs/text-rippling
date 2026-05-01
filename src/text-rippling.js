@@ -509,12 +509,24 @@
         // Square-root curve ≈ inverse of monitor gamma → perceptually
         // linear ramp. Faint trails stay visible without forcing high
         // brightness values.
-        const t = Math.sqrt(b);
+        //
+        // sqrt(b) has infinite slope at 0, so on its own it would leave a
+        // visible step at the `lit` cutoff (sqrt(0.005) ≈ 0.07 → ~4 RGB
+        // units of residual tint). Multiply by a smoothstep fade in the
+        // bottom 0..fadeStart region: 1.0 above fadeStart (visible range
+        // unchanged), tapering to 0 with zero slope at b = 0. The shadow
+        // params get the same fade so blur/alpha vanish in lockstep.
+        const fadeStart = 0.05;
+        let fade;
+        if (b >= fadeStart) fade = 1;
+        else { const u = b / fadeStart; fade = u * u * (3 - 2 * u); }
+
+        const t = Math.sqrt(b) * fade;
         const r = (baseRgb[0] + (wakeRgb[0] - baseRgb[0]) * t) | 0;
         const g = (baseRgb[1] + (wakeRgb[1] - baseRgb[1]) * t) | 0;
         const bl = (baseRgb[2] + (wakeRgb[2] - baseRgb[2]) * t) | 0;
         c.el.style.color = `rgb(${r},${g},${bl})`;
-        c.el.style.textShadow = `0 0 ${(b * 14).toFixed(1)}px rgba(${wakeRgbStr},${(b * 0.85).toFixed(2)})`;
+        c.el.style.textShadow = `0 0 ${(b * 14 * fade).toFixed(2)}px rgba(${wakeRgbStr},${(b * 0.85 * fade).toFixed(3)})`;
         c.wasLit = true;
       } else if (c.wasLit) {
         c.el.style.color = '';
