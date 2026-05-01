@@ -149,9 +149,12 @@
     // After the wavefront passes a char, the char's brightness decays
     // exponentially with time constant `ripplePostHit`.
     //
-    // Glyph swap fires only at the wavefront's narrow band, suppressed
-    // where the char is already lit by other (background) hits — so swaps
-    // cluster at the leading edge of the wake, not throughout it.
+    // Glyph swap fires ONLY at the outer frontier of the wake — the
+    // boundary between still-untouched chars and the wake's lit bulk.
+    // A char becomes "interior" the moment ANY stamp's wavefront has
+    // fully passed through it (edgeDist > edge AND timeFromHit > 0);
+    // from then on `scramble` is forced to 0, so the bulk of the wake
+    // shows lit-but-original glyphs, and only the leading ring scrambles.
     //
     // Ignores dx/dy/f. All coords are page-space (the framework's canonical
     // space) so the wake stays anchored to the document on scroll.
@@ -168,7 +171,8 @@
       const now = ctx.time;
 
       let brightness = 0;
-      let maxWavefront = 0;
+      let frontierAmp = 0;
+      let interior = false;
 
       for (let i = 0; i < stamps.length; i++) {
         const s = stamps[i];
@@ -189,13 +193,14 @@
         const edgeDist = Math.abs(timeFromHit) * speed;
         if (edgeDist < edge) {
           const es = (1 - edgeDist / edge) * amplAtHit;
-          if (es > maxWavefront) maxWavefront = es;
+          if (es > frontierAmp) frontierAmp = es;
+        } else if (timeFromHit > 0) {
+          // This stamp's wavefront has fully passed — char is in the wake bulk.
+          interior = true;
         }
       }
 
-      // Suppress scramble where the char is already lit from prior hits.
-      const bg = Math.max(0, brightness - maxWavefront);
-      const scramble = maxWavefront * Math.max(0, 1 - bg * 2);
+      const scramble = interior ? 0 : frontierAmp;
       return { brightness, scramble };
     },
   };
