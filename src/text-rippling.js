@@ -236,9 +236,16 @@
   //  CursorField — global pointer state + wave-stamp ring buffer.
   //
   //  Singleton. Multiple TextRippling instances share one cursor.
-  //  Stamps drop ONLY when the cursor moves at least STAMP_MIN_DIST
-  //  pixels — a parked cursor adds no new stamps, so existing wakes
-  //  decay to zero instead of being continuously re-fed.
+  //
+  //  Stamps drop in the pointer-event handler (not the rAF tick), so a
+  //  fast stroke that fires several events per frame yields several
+  //  stamps — the wake stays a continuous line instead of breaking into
+  //  one-stamp-per-frame beads. Where PointerEvent is supported we also
+  //  walk getCoalescedEvents() to harvest the browser's sub-frame samples
+  //  (typically 120–240 Hz on modern hardware), promoting each to a stamp.
+  //
+  //  Stamps still respect STAMP_MIN_DIST: a parked cursor adds no new
+  //  stamps so existing wakes decay to zero instead of being re-fed.
   //  Stamps are stored in page coordinates so the wake stays anchored
   //  to the document when the user scrolls.
   // ════════════════════════════════════════════════════════════════════
@@ -258,16 +265,64 @@
     let lastStampX = -1e6, lastStampY = -1e6;
     let attached = false;
 
+    function dropStamp(x, y, t) {
+      const dx = x - lastStampX;
+      const dy = y - lastStampY;
+      if (dx * dx + dy * dy < STAMP_MIN_DIST_SQ) return;
+      state.stamps.push({
+        x: x + (window.scrollX || window.pageXOffset || 0),
+        y: y + (window.scrollY || window.pageYOffset || 0),
+        t0: t,
+      });
+      lastStampX = x;
+      lastStampY = y;
+      if (state.stamps.length > STAMP_BUFFER_CAP) {
+        state.stamps.splice(0, state.stamps.length - STAMP_BUFFER_CAP);
+      }
+    }
+
     function attach() {
       if (attached) return;
       attached = true;
-      const onMove = (e) => { state.x = e.clientX; state.y = e.clientY; };
-      window.addEventListener('pointermove', onMove, { passive: true });
-      window.addEventListener('mousemove',   onMove, { passive: true });
-      window.addEventListener('touchmove', (e) => {
-        const t = e.touches && e.touches[0];
-        if (t) { state.x = t.clientX; state.y = t.clientY; }
-      }, { passive: true });
+
+      if (typeof window.PointerEvent !== 'undefined') {
+        window.addEventListener('pointermove', (e) => {
+          // Coalesced samples expose the browser's high-rate raw input
+          // that would otherwise be discarded when it batches events to
+          // one-per-frame. Chrome includes the event itself in the list;
+          // Firefox can return empty — fall back to the event in that case.
+          const samples = (typeof e.getCoalescedEvents === 'function')
+            ? e.getCoalescedEvents()
+            : null;
+          if (samples && samples.length > 0) {
+            for (let i = 0; i < samples.length; i++) {
+              const s = samples[i];
+              state.x = s.clientX;
+              state.y = s.clientY;
+              dropStamp(s.clientX, s.clientY, s.timeStamp);
+            }
+          } else {
+            state.x = e.clientX;
+            state.y = e.clientY;
+            dropStamp(e.clientX, e.clientY, e.timeStamp);
+          }
+        }, { passive: true });
+      } else {
+        const onMove = (e) => {
+          state.x = e.clientX;
+          state.y = e.clientY;
+          dropStamp(e.clientX, e.clientY, e.timeStamp);
+        };
+        window.addEventListener('mousemove', onMove, { passive: true });
+        window.addEventListener('touchmove', (e) => {
+          const t = e.touches && e.touches[0];
+          if (t) {
+            state.x = t.clientX;
+            state.y = t.clientY;
+            dropStamp(t.clientX, t.clientY, e.timeStamp);
+          }
+        }, { passive: true });
+      }
     }
 
     function update(now) {
@@ -276,23 +331,10 @@
       lastX = state.x;
       lastY = state.y;
 
-      if (state.x < -1e5) return;
-      const dx = state.x - lastStampX;
-      const dy = state.y - lastStampY;
-      if (dx * dx + dy * dy < STAMP_MIN_DIST_SQ) return;
-
-      state.stamps.push({
-        x: state.x + (window.scrollX || window.pageXOffset || 0),
-        y: state.y + (window.scrollY || window.pageYOffset || 0),
-        t0: now,
-      });
-      lastStampX = state.x;
-      lastStampY = state.y;
+      // Stamps are dropped in the pointer handler. Here we only age out
+      // expired entries; once per frame is enough for that.
       while (state.stamps.length > 0 && now - state.stamps[0].t0 > STAMP_MAX_AGE) {
         state.stamps.shift();
-      }
-      if (state.stamps.length > STAMP_BUFFER_CAP) {
-        state.stamps.splice(0, state.stamps.length - STAMP_BUFFER_CAP);
       }
     }
 
