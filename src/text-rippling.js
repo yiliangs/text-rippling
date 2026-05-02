@@ -459,11 +459,19 @@
 
       let touched = distSq < innerRSq;
       if (!touched) {
+        // Stash the result so Effects.ripple (when paired with this
+        // mode, e.g. bloom-ripple's effect: 'ripple') can reuse it
+        // instead of paying the per-stamp loop a second time. Note:
+        // when the char is inside cursor proximity (touched=true here)
+        // we skip the call entirely — Effects.ripple will recompute
+        // for that handful of chars, which is negligible vs the bulk.
         const r = Ripple.compute(
           c.hx, c.hy, ctx.time, ctx.stamps,
           opts.rippleSpeed, opts.rippleSpatialAtten,
           opts.ripplePostHit, opts.rippleEdge,
         );
+        c._rippleStash = r;
+        c._rippleStashFrame = ctx.frameId;
         if (r && r.brightness > c.seed) touched = true;
       }
       if (touched) WordReveal.touch(c, distSq);
@@ -772,7 +780,17 @@
     // the wake reaches across the whole page, not just the falloff radius.
     // Ignores dx/dy/f because wake amplitude is determined by stamp history,
     // not by the current cursor distance.
+    //
+    // Memo: when wave / bloom-ripple modes are active, wordWaveFrame
+    // already computed Ripple for this char this frame and stashed it on
+    // c._rippleStash. Reuse it to avoid a second O(stamps) loop. Frame
+    // mismatch → stash is from a previous frame (or never populated, e.g.
+    // cursor mode) → recompute as before.
     ripple(dx, dy, dist, f, p, ctx) {
+      const c = ctx.char;
+      if (c && c._rippleStashFrame === ctx.frameId) {
+        return c._rippleStash || REST;
+      }
       return Ripple.compute(
         ctx.charX, ctx.charY, ctx.time, ctx.stamps,
         p.rippleSpeed, p.rippleSpatialAtten, p.ripplePostHit, p.rippleEdge,
@@ -834,7 +852,14 @@
     const STAMP_MIN_DIST = 5;
     const STAMP_MIN_DIST_SQ = STAMP_MIN_DIST * STAMP_MIN_DIST;
     const STAMP_MAX_AGE = 2000;
-    const STAMP_BUFFER_CAP = 200;
+    // Cap on stamps in flight. With STAMP_MIN_DIST=5 and a fast continuous
+    // stroke (~16 px/frame at 60Hz), one stamp drops per frame; over the
+    // 2s STAMP_MAX_AGE window that's ~120 stamps. Capping at 100 truncates
+    // the oldest tail, which is below the 0.02 amplitude floor anyway
+    // (a stamp 1.3s old contributes ~0.019 brightness at the wavefront —
+    // imperceptible). Per-char Ripple.compute is O(stamps), so this cap
+    // is a direct multiplier on every consumer's hot loop.
+    const STAMP_BUFFER_CAP = 100;
 
     const state = {
       x: -1e6, y: -1e6,
@@ -1091,6 +1116,12 @@
         originalChar,
         // Deterministic seed for effects/strategies that want per-char jitter.
         seed: Math.random(),
+        // Per-frame Ripple.compute memo. wordWaveFrame populates this
+        // when it runs (wave / bloom-ripple modes); Effects.ripple checks
+        // _rippleStashFrame === ctx.frameId before recomputing. Pre-init
+        // both fields so V8 keeps the Char shape monomorphic.
+        _rippleStash: null,
+        _rippleStashFrame: -1,
       };
       // Per-module field hand-off — see each module's initChar comment
       // for the field set it owns.
@@ -1449,6 +1480,7 @@
       this._ro = null;
       this._springAccum = 0;
       this._redactNextTurn = 0;
+      this._frameId = 0;
       this._destroyed = false;
 
       this._captureBaseColor();
@@ -1568,6 +1600,7 @@
       const baseRgb = this._baseColorRgb || [200, 200, 200];
 
       const ctx = makeContext(now);
+      ctx.frameId = ++this._frameId;
       const r = opts.radius;
       const rCutoffSq = (r * 2) * (r * 2);
       const isGlobal = effect.global === true;
@@ -1664,7 +1697,14 @@
       mouseVy: CursorField.state.vy,
       time:    now,
       stamps:  CursorField.state.stamps,
-      charX: 0, charY: 0, charSeed: 0,
+      // Per-frame instance counter. wordWaveFrame stamps it onto each
+      // char's Ripple memo; Effects.ripple compares to know if the
+      // stash is from this frame or stale. Set by _tick.
+      frameId: 0,
+      // Per-char scratch fields, mutated by evalCharTarget before each
+      // effect call so effects can reach back to the char without
+      // changing their (dx, dy, dist, f, opts, ctx) signature.
+      charX: 0, charY: 0, charSeed: 0, char: null,
     };
   }
 
@@ -1693,6 +1733,7 @@
     ctx.charX = c.hx;
     ctx.charY = c.hy;
     ctx.charSeed = c.seed;
+    ctx.char = c;
     return effect(dx, dy, dist, f, opts, ctx) || REST;
   }
 
