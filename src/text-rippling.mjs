@@ -10,6 +10,7 @@ export const effects      = TextRippling.effects;
 export const falloffs     = TextRippling.falloffs;
 export const glyphPickers = TextRippling.glyphPickers;
 export const ripple       = TextRippling.ripple;
+export const wordReveal   = TextRippling.wordReveal;
 export const revealLayer  = TextRippling.revealLayer;
 export const waveReveal   = TextRippling.waveReveal;
 export const redact       = TextRippling.redact;
