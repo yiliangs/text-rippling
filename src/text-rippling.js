@@ -195,6 +195,33 @@
   // ════════════════════════════════════════════════════════════════════
 
   const RevealLayer = {
+    // Per-char field ownership: this module is responsible for these
+    // five Char fields. Char.create calls initChar to give each new
+    // char the right defaults, so this module's fields don't need to
+    // be hand-maintained in Char.create.
+    //
+    //   revealChar      — null | string  : lower-layer glyph (set by attach)
+    //   revealed        — boolean        : sticky latch (RevealLayer + WaveReveal write it)
+    //   colorPinned     — boolean        : renderer-side latch paired with revealed
+    //   revealAt        — 0 | timestamp  : pending fringe-timer firing time
+    //   revealHoldUntil — 0 | timestamp  : WaveReveal's hold-and-revert timer
+    initChar(c) {
+      c.revealChar = null;
+      c.revealed = false;
+      c.colorPinned = false;
+      c.revealAt = 0;
+      c.revealHoldUntil = 0;
+    },
+
+    // Lifecycle hook: react to options changes from TextRippling.update().
+    // Owned cleanup logic lives here, not in update(), so adding a new
+    // reveal-related option doesn't require editing the façade.
+    onUpdate(prev, curr, chars, element) {
+      if (curr.revealText !== prev.revealText) {
+        RevealLayer.attach(chars, curr, element);
+      }
+    },
+
     // Walk chars[] and fill `revealChar` per visible position. Sources
     // (in priority order):
     //   1. `opts.revealText` (string)
@@ -403,6 +430,36 @@
   // ════════════════════════════════════════════════════════════════════
 
   const Redact = {
+    // Per-char field ownership: this module is responsible for these
+    // three Char fields, populated by Char.create via initChar.
+    //
+    //   redacted    — boolean : currently rendered as the cover bar
+    //   redactZone  — 0/1/2  : 0=outside, 1=core, 2=band (entry detection)
+    //   coverShown  — boolean : renderer-side latch for Renderer.cover
+    initChar(c) {
+      c.redacted = false;
+      c.redactZone = 0;
+      c.coverShown = false;
+    },
+
+    // Lifecycle hook: react to options changes from TextRippling.update().
+    //   - Effect switched away from 'redact' → clear per-char state so
+    //     Renderer.cover hides any still-shown bars on the next tick.
+    //   - redactColor changed → re-paint every cover element so chars
+    //     currently covered show the new color immediately.
+    onUpdate(prev, curr, chars) {
+      if (prev.effect === 'redact' && curr.effect !== 'redact') {
+        for (const c of chars) {
+          c.redacted = false;
+          c.redactZone = 0;
+        }
+      }
+      if (curr.redactColor !== prev.redactColor) {
+        const bg = curr.redactColor || 'currentColor';
+        for (const c of chars) c.coverEl.style.background = bg;
+      }
+    },
+
     tick(c, ctx, opts) {
       const dx = c.hx - ctx.mouseX;
       const dy = c.hy - ctx.mouseY;
@@ -820,16 +877,17 @@
   // ════════════════════════════════════════════════════════════════════
 
   const Char = {
+    // Intrinsic fields only — fields owned by an optional module are
+    // populated by that module's initChar(c) hook (called below).
+    // Adding a new module should not require editing this method.
     create(el, originalChar, textEl, coverEl) {
-      return {
+      const c = {
         el,
         // Two-layer split (see Splitter banner): textEl carries the
         // glyph and owns the slot's layout dimensions; coverEl is the
-        // absolutely-positioned redact bar painted on top, toggled by
-        // Renderer.cover on c.redacted transitions.
+        // absolutely-positioned redact bar painted on top.
         textEl,
         coverEl,
-        coverShown: false,
         // Page-space center, refreshed by _measure on resize/scroll/font-load.
         hx: 0, hy: 0,
         // Transform channel: position + rotation + scale, with velocities.
@@ -843,39 +901,14 @@
         scrambled: false,
         nextSwap: 0,
         originalChar,
-        // Lower-layer counterpart for the optional RevealLayer module.
-        // Null when no reveal text is configured for this position.
-        revealChar: null,
-        // Sticky latch: set true the first time RevealLayer.showLower
-        // returns true for this char, never cleared. The reveal behaves
-        // like a scratched lottery ticket — once a position has been
-        // exposed by a wavefront, it stays revealed for the lifetime of
-        // the instance, regardless of whether the wake has faded.
-        revealed: false,
-        // Companion latch on the renderer side: tracks whether the
-        // pinned reveal color has been written to inline style yet.
-        // Reset by Renderer.colorAndGlow if `revealed` flips back.
-        colorPinned: false,
-        // Pending-reveal timer set by RevealLayer when cursor first
-        // enters the fringe. 0 = unengaged. >0 = absolute timestamp
-        // (DOMHighResTimeStamp) at which the latch should fire.
-        revealAt: 0,
-        // Hold-and-revert timer used by WaveReveal. Refreshed forward
-        // each frame the wave amplitude is above this char's seed; the
-        // char flips back to the cover once `now` passes this timestamp.
-        revealHoldUntil: 0,
-        // Stochastic block-redaction state (driven by Redact module).
-        // `redacted` = currently rendered as the redact glyph;
-        // `redactZone` classifies cursor proximity (0=outside,
-        // 1=inner core, 2=fringe band). The zone is tracked so band
-        // entry can be detected once and the boolean state seeded by
-        // gradient — between entry and exit, only the periodic
-        // turnover swaps the boolean.
-        redacted: false,
-        redactZone: 0,
         // Deterministic seed for effects/strategies that want per-char jitter.
         seed: Math.random(),
       };
+      // Per-module field hand-off — see each module's initChar comment
+      // for the field set it owns.
+      RevealLayer.initChar(c);
+      Redact.initChar(c);
+      return c;
     },
 
     // Critically-stable spring step — accumulates velocity from spring force
@@ -1151,34 +1184,19 @@
     }
 
     update(options) {
-      const prevReveal      = this.options.revealText;
-      const prevEffect      = this.options.effect;
-      const prevRedactColor = this.options.redactColor;
+      // Snapshot prev opts so module onUpdate hooks can diff. Shallow
+      // clone is cheap (~25 keys) and avoids per-key stash-pairs that
+      // each new option would otherwise add to this method.
+      const prev = Object.assign({}, this.options);
       Object.assign(this.options, options);
       this._wakeCache = null;
       this._revealCache = null;
-      // Reveal text changed (or `data-reveal` may now be the source) —
-      // re-walk chars to refresh their `revealChar` assignments.
-      if (this.options.revealText !== prevReveal) {
-        RevealLayer.attach(this._chars, this.options, this.element);
-      }
-      // Effect switched away from 'redact' — Redact.tick won't run any
-      // more, so any char still flagged redacted would stay covered
-      // forever. Clear the state here; Renderer.cover will hide the
-      // bar on the next frame's transition check.
-      if (prevEffect === 'redact' && this.options.effect !== 'redact') {
-        for (const c of this._chars) {
-          c.redacted = false;
-          c.redactZone = 0;
-        }
-      }
-      // redactColor changed — re-apply to every cover element so the
-      // next show transition picks up the new background. Done eagerly
-      // so chars currently covered re-paint immediately.
-      if (this.options.redactColor !== prevRedactColor) {
-        const bg = this.options.redactColor || 'currentColor';
-        for (const c of this._chars) c.coverEl.style.background = bg;
-      }
+      // Per-module lifecycle fan-out. Each module owns its own
+      // diff/cleanup logic — adding a new module's update side effects
+      // means adding one onUpdate call here, not threading another
+      // prev/curr stash through the body.
+      RevealLayer.onUpdate(prev, this.options, this._chars, this.element);
+      Redact.onUpdate(prev, this.options, this._chars);
     }
 
     remeasure() {
