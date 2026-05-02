@@ -421,11 +421,62 @@
     },
   };
 
-  // Module-private scratch Set, reused frame-to-frame to avoid
-  // per-frame allocation. RevealLayer.frame and WaveReveal.frame both
-  // borrow it during their own pass — they don't run concurrently
-  // (revealMode dispatch is single-mode per instance per frame).
+  // Module-private scratch Set, reused frame-to-frame to avoid per-frame
+  // allocation. RevealLayer.frame and wordWaveFrame (the shared core
+  // behind WaveReveal and BloomRipple) both borrow it during their own
+  // pass — they don't run concurrently (revealMode dispatch is
+  // single-mode per instance per frame).
   const _wordScratch = new Set();
+
+  // ════════════════════════════════════════════════════════════════════
+  //  wordWaveFrame — shared three-pass orchestrator behind both
+  //  WaveReveal (sticky=false) and BloomRipple (sticky=true).
+  //
+  //  Same shape as RevealLayer.frame: touch → tickWord → applyChar. The
+  //  touch predicate is cursor proximity OR wave amplitude > c.seed
+  //  (per the WaveReveal banner below). The two modules differ only in
+  //  the (sticky, holdMs) pair handed to WordReveal.tickWord — sticky
+  //  freezes the active→collapse transition, holdMs sets the idle
+  //  window for the non-sticky path.
+  // ════════════════════════════════════════════════════════════════════
+
+  function wordWaveFrame(chars, ctx, opts, sticky, holdMs) {
+    const stepMs = opts.revealWordStepMs;
+    const innerR = opts.revealRadius;
+    const innerRSq = innerR * innerR;
+    _wordScratch.clear();
+
+    for (let i = 0; i < chars.length; i++) {
+      const c = chars[i];
+      if (c.revealChar == null) { c.revealed = false; continue; }
+      const w = c.wordState;
+      if (!w) continue;
+      if (!_wordScratch.has(w)) { WordReveal.resetScratch(w); _wordScratch.add(w); }
+
+      const dx = c.hx - ctx.mouseX;
+      const dy = c.hy - ctx.mouseY;
+      const distSq = dx * dx + dy * dy;
+
+      let touched = distSq < innerRSq;
+      if (!touched) {
+        const r = Ripple.compute(
+          c.hx, c.hy, ctx.time, ctx.stamps,
+          opts.rippleSpeed, opts.rippleSpatialAtten,
+          opts.ripplePostHit, opts.rippleEdge,
+        );
+        if (r && r.brightness > c.seed) touched = true;
+      }
+      if (touched) WordReveal.touch(c, distSq);
+    }
+
+    for (const w of _wordScratch) WordReveal.tickWord(w, ctx.time, holdMs, sticky);
+
+    for (let i = 0; i < chars.length; i++) {
+      const c = chars[i];
+      if (c.revealChar == null) continue;
+      WordReveal.applyChar(c, ctx.time, stepMs);
+    }
+  }
 
   // ════════════════════════════════════════════════════════════════════
   //  WaveReveal — reversible wave-driven dithered two-layer overlay
@@ -472,47 +523,45 @@
   // ════════════════════════════════════════════════════════════════════
 
   const WaveReveal = {
-    // Per-frame orchestrator. Three passes (touch → tickWord → render)
-    // analogous to RevealLayer.frame; the only difference is the touch
-    // predicate (cursor proximity OR wave amplitude > seed) and the
-    // non-sticky tickWord call (collapse on hold expiry).
     frame(chars, ctx, opts) {
-      const stepMs = opts.revealWordStepMs;
-      const holdMs = opts.revealHoldMs;
-      const innerR = opts.revealRadius;
-      const innerRSq = innerR * innerR;
-      _wordScratch.clear();
+      wordWaveFrame(chars, ctx, opts, false, opts.revealHoldMs);
+    },
+  };
 
-      for (let i = 0; i < chars.length; i++) {
-        const c = chars[i];
-        if (c.revealChar == null) { c.revealed = false; continue; }
-        const w = c.wordState;
-        if (!w) continue;
-        if (!_wordScratch.has(w)) { WordReveal.resetScratch(w); _wordScratch.add(w); }
+  // ════════════════════════════════════════════════════════════════════
+  //  BloomRipple — wave-driven sticky bloom layered with ripple styling.
+  //
+  //  Composition of two existing systems, run in sequence per char:
+  //
+  //    Phase 1 (this module): word-level activation using the same touch
+  //    criteria as WaveReveal (cursor proximity OR wave amplitude > c.seed)
+  //    and the same WordReveal bloom mechanic. STICKY — once a word is
+  //    revealed, its chars stay revealed; tickWord is called with sticky=true
+  //    so the COLLAPSING transition is skipped entirely.
+  //
+  //    Phase 2 (Effects.ripple, set by user as `effect: 'ripple'`): the
+  //    ordinary ripple physics drives c.bright per char from the wave
+  //    amplitude history. Renderer.colorAndGlowBloom (paired with this
+  //    mode via REVEAL_MODES) then lerps revealed chars from `revealColor`
+  //    (static gray) toward `wakeColor` (ripple peak white). Unrevealed
+  //    chars stay at the CSS cover color and ignore c.bright entirely.
+  //
+  //  Color contract:
+  //    - unrevealed         → CSS color (cover, e.g. dark gray)
+  //    - revealed, idle     → opts.revealColor (e.g. medium gray)
+  //    - revealed, ripple   → lerp from revealColor toward wakeColor
+  //
+  //  This keeps the static-revealed state visually distinct from the
+  //  ripple peak — the user picks gray for `revealColor` so peaks at
+  //  white read as wave activity, not as "this letter just appeared".
+  //
+  //  Frame body delegates to wordWaveFrame; the only difference from
+  //  WaveReveal is the sticky=true / holdMs=Infinity pair.
+  // ════════════════════════════════════════════════════════════════════
 
-        const dx = c.hx - ctx.mouseX;
-        const dy = c.hy - ctx.mouseY;
-        const distSq = dx * dx + dy * dy;
-
-        let touched = distSq < innerRSq;
-        if (!touched) {
-          const r = Ripple.compute(
-            c.hx, c.hy, ctx.time, ctx.stamps,
-            opts.rippleSpeed, opts.rippleSpatialAtten,
-            opts.ripplePostHit, opts.rippleEdge,
-          );
-          if (r && r.brightness > c.seed) touched = true;
-        }
-        if (touched) WordReveal.touch(c, distSq);
-      }
-
-      for (const w of _wordScratch) WordReveal.tickWord(w, ctx.time, holdMs, false);
-
-      for (let i = 0; i < chars.length; i++) {
-        const c = chars[i];
-        if (c.revealChar == null) continue;
-        WordReveal.applyChar(c, ctx.time, stepMs);
-      }
+  const BloomRipple = {
+    frame(chars, ctx, opts) {
+      wordWaveFrame(chars, ctx, opts, true, Infinity);
     },
   };
 
@@ -1094,6 +1143,26 @@
   //  the cost of inactive chars near zero.
   // ════════════════════════════════════════════════════════════════════
 
+  // Shared lit-branch math: clamp brightness, smoothstep-fade the
+  // bottom 0..fadeStart range to kill the sqrt() step at the lit cutoff,
+  // sqrt-ramp for perceptual linearity, then write the per-component RGB
+  // lerp + matching textShadow directly to the el. Used by both
+  // colorAndGlow (base→wake) and colorAndGlowBloom (reveal→wake) — same
+  // math, different endpoints.
+  function writeLitColor(el, brightness, fromRgb, toRgb, wakeStr) {
+    const b = brightness > 1 ? 1 : brightness;
+    const fadeStart = 0.05;
+    let fade;
+    if (b >= fadeStart) fade = 1;
+    else { const u = b / fadeStart; fade = u * u * (3 - 2 * u); }
+    const t = Math.sqrt(b) * fade;
+    const r = (fromRgb[0] + (toRgb[0] - fromRgb[0]) * t) | 0;
+    const g = (fromRgb[1] + (toRgb[1] - fromRgb[1]) * t) | 0;
+    const bl = (fromRgb[2] + (toRgb[2] - fromRgb[2]) * t) | 0;
+    el.style.color = `rgb(${r},${g},${bl})`;
+    el.style.textShadow = `0 0 ${(b * 14 * fade).toFixed(2)}px rgba(${wakeStr},${(b * 0.85 * fade).toFixed(3)})`;
+  }
+
   const Renderer = {
     transform(c) {
       const idle =
@@ -1141,36 +1210,69 @@
         c.wasLit = false;
       }
 
+      // Lit branch: ramp base→wake by brightness via writeLitColor (the
+      // sqrt + smoothstep math is shared with colorAndGlowBloom — see
+      // its banner above the helper for the curve rationale).
       const lit = c.bright > 0.005;
       if (lit) {
-        const b = c.bright > 1 ? 1 : c.bright;
-        // Square-root curve ≈ inverse of monitor gamma → perceptually
-        // linear ramp. Faint trails stay visible without forcing high
-        // brightness values.
-        //
-        // sqrt(b) has infinite slope at 0, so on its own it would leave a
-        // visible step at the `lit` cutoff (sqrt(0.005) ≈ 0.07 → ~4 RGB
-        // units of residual tint). Multiply by a smoothstep fade in the
-        // bottom 0..fadeStart region: 1.0 above fadeStart (visible range
-        // unchanged), tapering to 0 with zero slope at b = 0. The shadow
-        // params get the same fade so blur/alpha vanish in lockstep.
-        const fadeStart = 0.05;
-        let fade;
-        if (b >= fadeStart) fade = 1;
-        else { const u = b / fadeStart; fade = u * u * (3 - 2 * u); }
-
-        const t = Math.sqrt(b) * fade;
-        const r = (baseRgb[0] + (wakeRgb[0] - baseRgb[0]) * t) | 0;
-        const g = (baseRgb[1] + (wakeRgb[1] - baseRgb[1]) * t) | 0;
-        const bl = (baseRgb[2] + (wakeRgb[2] - baseRgb[2]) * t) | 0;
-        c.el.style.color = `rgb(${r},${g},${bl})`;
-        c.el.style.textShadow = `0 0 ${(b * 14 * fade).toFixed(2)}px rgba(${wakeRgbStr},${(b * 0.85 * fade).toFixed(3)})`;
+        writeLitColor(c.el, c.bright, baseRgb, wakeRgb, wakeRgbStr);
         c.wasLit = true;
       } else if (c.wasLit) {
         c.el.style.color = '';
         c.el.style.textShadow = '';
         c.bright = 0;
         c.wasLit = false;
+      }
+    },
+
+    // BloomRipple-mode color writer. Replaces the discrete pin behavior of
+    // colorAndGlow with a brightness-modulated lerp specifically targeted
+    // at revealed chars — the user wants ripple to "stylize" the revealed
+    // text, not blink past it as a hard switch. Three states the writer
+    // produces, mirroring the BloomRipple banner's color contract:
+    //
+    //   !revealed                  →  CSS color (no inline style; the
+    //                                 cover layer is the dark-gray base)
+    //   revealed, bright ≈ 0       →  static at revealRgb (medium gray)
+    //   revealed, bright > 0       →  lerp from revealRgb toward wakeRgb
+    //                                 with the same gamma + fade-out
+    //                                 curves as colorAndGlow
+    //
+    // Reuses c.colorPinned as a "have I written an explicit color this
+    // session" latch so we only touch the DOM on transitions. c.wasLit
+    // tracks whether the last write was the lerp (vs the static reveal
+    // color) so we can fall back cleanly when ripple amplitude decays.
+    colorAndGlowBloom(c, revealRgb, wakeRgb, wakeRgbStr) {
+      if (!c.revealed) {
+        // Cover state: drop any inline color so the CSS-default cover
+        // color shows through. Reset the latches so the next reveal
+        // re-paints from scratch.
+        if (c.wasLit || c.colorPinned) {
+          c.el.style.color = '';
+          c.el.style.textShadow = '';
+          c.bright = 0;
+          c.wasLit = false;
+          c.colorPinned = false;
+        }
+        return;
+      }
+
+      const lit = c.bright > 0.005;
+      if (lit) {
+        // Lit branch: ramp reveal→wake by brightness via writeLitColor
+        // (shared math with colorAndGlow — only the endpoints differ).
+        writeLitColor(c.el, c.bright, revealRgb, wakeRgb, wakeRgbStr);
+        c.wasLit = true;
+        c.colorPinned = true;
+      } else if (c.wasLit || !c.colorPinned) {
+        // Settle to the static reveal color (gray). Two trigger paths:
+        // (a) just transitioned out of the lit lerp (c.wasLit), or
+        // (b) just freshly revealed (c.colorPinned still false from cover).
+        c.el.style.color = `rgb(${revealRgb[0]},${revealRgb[1]},${revealRgb[2]})`;
+        c.el.style.textShadow = '';
+        c.bright = 0;
+        c.wasLit = false;
+        c.colorPinned = true;
       }
     },
 
@@ -1220,6 +1322,48 @@
   };
 
   // ════════════════════════════════════════════════════════════════════
+  //  Reveal mode strategy table. Each entry bundles (a) the per-frame
+  //  word orchestrator and (b) the per-char color writer that pairs
+  //  with it. _tick looks up one bundle by `opts.revealMode` and
+  //  dispatches through it — adding a new mode means adding one entry
+  //  here, not threading two parallel if-ladders through _tick.
+  //
+  //  The mode→writer pairing was previously implicit (a `isBloomRipple`
+  //  flag in _tick chose the writer), which left it possible to add a
+  //  new mode and forget to wire its writer. Bundling makes the
+  //  coupling explicit.
+  //
+  //  Color writer signature: (c, x) where x is a per-frame ctx with
+  //  resolved color endpoints — baseRgb, wakeRgb, wakeStr, revealRgb,
+  //  revealStr (revealRgb/Str fall back to wakeRgb/Str when revealColor
+  //  is unset). Writers internally derive any per-char state they need.
+  // ════════════════════════════════════════════════════════════════════
+
+  // Default writer — paired with cursor and wave modes. Picks lerp
+  // endpoint per char based on whether the lower (reveal) layer is
+  // currently shown for that char.
+  function defaultColorWriter(c, x) {
+    const showLower = c.revealed && c.revealChar != null;
+    const lerpRgb = showLower ? x.revealRgb : x.wakeRgb;
+    const lerpStr = showLower ? x.revealStr : x.wakeStr;
+    Renderer.colorAndGlow(c, x.baseRgb, lerpRgb, lerpStr);
+  }
+
+  // Bloom writer — paired with bloom-ripple. Always lerps revealed
+  // chars from revealRgb (static gray) toward wakeRgb (ripple peak).
+  // Unrevealed chars are handled inside colorAndGlowBloom (cover state,
+  // no inline style).
+  function bloomColorWriter(c, x) {
+    Renderer.colorAndGlowBloom(c, x.revealRgb, x.wakeRgb, x.wakeStr);
+  }
+
+  const REVEAL_MODES = {
+    'cursor':       { frame: RevealLayer.frame, colorWriter: defaultColorWriter },
+    'wave':         { frame: WaveReveal.frame,  colorWriter: defaultColorWriter },
+    'bloom-ripple': { frame: BloomRipple.frame, colorWriter: bloomColorWriter  },
+  };
+
+  // ════════════════════════════════════════════════════════════════════
   //  DEFAULTS — every option is a knob exposed to the user.
   // ════════════════════════════════════════════════════════════════════
 
@@ -1247,12 +1391,15 @@
     rippleSpatialAtten: Ripple.DEFAULTS.spatial,  // px — wave amplitude is 1/e at this distance
     ripplePostHit:      Ripple.DEFAULTS.postHit,  // ms — exp decay after wavefront passes
     rippleEdge:         Ripple.DEFAULTS.edge,     // px — width of the swap band at the wavefront
-    // Reveal layer — independent of effect. Both modes are word-level
+    // Reveal layer — independent of effect. All three modes are word-level
     // (see WordReveal banner): touching any char activates its whole
     // word and the word blooms outward letter-by-letter from the
-    // cursor-closest anchor. Three settings:
+    // cursor-closest anchor. Settings:
     //   'cursor' (default) — sticky proximity reveal (RevealLayer)
     //   'wave'             — reversible wave-driven (WaveReveal)
+    //   'bloom-ripple'     — sticky wave-driven bloom; pair with
+    //                        effect: 'ripple' to stylize revealed words
+    //                        (BloomRipple + Renderer.colorAndGlowBloom)
     //   any other value    — neither runs (still allows revealText to be set
     //                        without effect, e.g., for plugin-driven reveal)
     revealMode:      'cursor',
@@ -1329,6 +1476,15 @@
       Object.assign(this.options, options);
       this._wakeCache = null;
       this._revealCache = null;
+      // Reveal-mode change: c.colorPinned and c.wasLit have different
+      // invariants per writer (defaultColorWriter treats colorPinned as
+      // "revealed-and-painted-with-revealColor"; bloomColorWriter treats
+      // it as "I've written some explicit color"). Swapping writers
+      // mid-life would leave the new writer reading the old writer's
+      // latch state — clear both so it starts from a known cover state.
+      if (prev.revealMode !== this.options.revealMode) {
+        for (const c of this._chars) { c.colorPinned = false; c.wasLit = false; }
+      }
       // Per-module lifecycle fan-out. Each module owns its own
       // diff/cleanup logic — adding a new module's update side effects
       // means adding one onUpdate call here, not threading another
@@ -1435,20 +1591,27 @@
         this._redactNextTurn = now + opts.redactTurnoverMs;
       }
 
-      // Reveal: pre-loop frame orchestration sets c.revealed for every
-      // char. Both modes are word-level — touch detection, word-state
-      // transition, and per-char render derivation. Dispatch by mode:
-      //   'cursor' → RevealLayer (sticky, cursor-proximity touch)
-      //   'wave'   → WaveReveal (reversible, cursor + wave-amp touch)
-      //   any other value → neither runs (c.revealed unchanged frame
-      //                     to frame; instances that don't want reveal
-      //                     just leave revealText empty so revealChar
-      //                     is null and applyChar forces revealed=false)
-      if (opts.revealMode === 'cursor') {
-        RevealLayer.frame(this._chars, ctx, opts);
-      } else if (opts.revealMode === 'wave') {
-        WaveReveal.frame(this._chars, ctx, opts);
-      }
+      // Reveal: look up the (frame, colorWriter) bundle for this mode.
+      // The frame runs once per tick and sets c.revealed for every char;
+      // the writer is called per-char inside the loop below. Unknown
+      // mode → no frame runs and the default writer is used (this is
+      // how an effect-only instance with no reveal feature works —
+      // leave revealText empty so applyChar wouldn't latch anything
+      // anyway, and the writer's revealed branches stay dormant).
+      const modeBundle = REVEAL_MODES[opts.revealMode];
+      if (modeBundle) modeBundle.frame(this._chars, ctx, opts);
+      const colorWriter = modeBundle ? modeBundle.colorWriter : defaultColorWriter;
+
+      // Per-frame color context — resolve endpoints once so the per-char
+      // writer doesn't have to re-check this._revealCache for every glyph.
+      // revealRgb/Str fall back to wakeRgb/Str when revealColor is unset.
+      const colorCtx = {
+        baseRgb,
+        wakeRgb,
+        wakeStr,
+        revealRgb: this._revealCache ? this._revealCache.rgb : wakeRgb,
+        revealStr: this._revealCache ? this._revealCache.str : wakeStr,
+      };
 
       for (const c of this._chars) {
         const target = evalCharTarget(c, ctx, effect, falloff, opts, isGlobal, rCutoffSq);
@@ -1473,11 +1636,9 @@
         const showLower      = c.revealed && c.revealChar != null;
         const scrambleTarget = c.redacted ? 0 : (target.scramble || 0);
         const naturalGlyph   = showLower ? c.revealChar : c.originalChar;
-        const lerpRgb = showLower && this._revealCache ? this._revealCache.rgb : wakeRgb;
-        const lerpStr = showLower && this._revealCache ? this._revealCache.str : wakeStr;
 
         Renderer.transform(c);
-        Renderer.colorAndGlow(c, baseRgb, lerpRgb, lerpStr);
+        colorWriter(c, colorCtx);
         Renderer.glyph(c, scrambleTarget, now, opts, picker, naturalGlyph);
         Renderer.cover(c);
       }
@@ -1577,6 +1738,9 @@
   // WaveReveal is exposed similarly — public API: .frame(chars, ctx, opts)
   // for the wave-driven reversible reveal mode.
   TextRippling.waveReveal   = WaveReveal;
+  // BloomRipple — public API: .frame(chars, ctx, opts) for the wave-driven
+  // sticky bloom that pairs with effect: 'ripple' for styled revealed text.
+  TextRippling.bloomRipple  = BloomRipple;
   // Redact is exposed for plugin authors that want to drive the
   // stochastic block redaction directly (skip Effects.redact dispatch).
   TextRippling.redact       = Redact;
@@ -1597,6 +1761,7 @@
     module.exports.wordReveal    = WordReveal;
     module.exports.revealLayer   = RevealLayer;
     module.exports.waveReveal    = WaveReveal;
+    module.exports.bloomRipple   = BloomRipple;
     module.exports.redact        = Redact;
     module.exports.version       = VERSION;
   }
