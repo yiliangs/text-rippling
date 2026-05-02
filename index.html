@@ -84,10 +84,43 @@
       </div>
     </article>
 
+    <article class="card redact-card">
+      <h2 class="label">redact <span class="label-note">— stochastic block redaction with morphing turnover</span></h2>
+      <div class="demo-text mono redact-text"
+           data-effect="redact"
+           data-redact-radius="80"
+           data-redact-fringe="120">
+        Hold your cursor anywhere over this paragraph. Inside the inner radius every character collapses into a solid block; in the outer fringe band the redaction thins out with distance, and twice each second roughly thirty percent of the redacted glyphs slide back to their original form while the same number of unredacted glyphs flip into blocks alongside them, so the total density holds steady but the membership keeps churning. Drag the cursor and the redaction zone follows you, eating new text at the leading edge and exhaling old text behind. Stand still and the morph still runs underneath, an unsettled black bar that never quite settles on which glyphs it has chosen to hide.
+      </div>
+    </article>
+
     <article class="card ripple-card">
       <h2 class="label">ripple <span class="label-note">— the headline effect</span></h2>
       <div class="demo-text mono ripple-text" data-effect="ripple">
         Pudgy Penguins, a creative venture founded in 2021, quickly gained attention for its unique IP and engaging community. In 2022, the company was acquired by Igloo Inc., a strategic move aimed at expanding its reach and capabilities. The acquisition by Igloo Inc. was part of a broader vision to transform and reposition Pudgy Penguins as a next-generation entertainment company and the face of Web3 worldwide. Drag your cursor anywhere over this paragraph and watch the wake propagate as expanding wavefronts; characters flip case (or to a symbol) only at the boundary where each ripple's edge sweeps past — never inside the bright wake, never outside it.
+      </div>
+    </article>
+
+    <article class="card waverev-card">
+      <h2 class="label">wave-reveal <span class="label-note">— pixelated ripple via per-char dithering</span></h2>
+      <div class="demo-text mono waverev-text"
+           data-effect="none"
+           data-reveal-mode="wave"
+           data-reveal-color="#FFFFFF"
+           data-reveal="Move your cursor across this paragraph and the same ring-physics that drives the smooth ripple wake will also drive this overlay, but instead of fading the chars in a continuous color gradient it converts the per-glyph wave amplitude into a binary state via a per-char threshold, and as the wave peak rolls past every position the local fraction of revealed glyphs tracks the local amplitude — half-amplitude regions show roughly half their glyphs flipped to white, full amplitude regions reveal nearly all of them. Behind the wavefront, as the wake decays, glyphs flip back to the dim cover in seed order, the high-threshold ones reverting first and the low-threshold ones holding the longest. The result reads as a pixelated ripple — same propagation, same multi-stamp interference, same eventual return to silence — only the smooth color tint is replaced by a stippled binary state per glyph that lets you see the wave physics one pixel at a time.">
+        #### #### ###### ###### #### ######### ### ### #### ############ #### ###### ### ###### ###### #### #### #### ##### #### ######## ### ####### ## ###### ### ##### ## # ########## ##### ######## ## ######## ### ######### #### ######### #### # ###### ##### ### # ######## ########## ### ## ### #### #### ##### #### ##### ######## ### ##### ######## ## ######## ###### ###### ### ##### ######### # ############## ####### #### ####### #### ##### ###### ####### ## ###### #### ######### ####### ###### ###### ### ## ##### ###### ### ########## ## ### #### ####### ###### #### #### ## ### ### ##### ## #### ###### ### ############## #### ######### ##### ### ### ############# #### ####### ### ######## ### ###### ##### ## # ######### ###### # #### ############ #### ########### ############# #### ######## ###### ## ####### # #### ### ###### ##### #### ## ######## ## # ######## ###### ##### ### ##### #### #### ### ### ### #### ####### ### ##### ## # #####
+      </div>
+    </article>
+
+    <article class="card reveal-card">
+      <h2 class="label">reveal <span class="label-note">— drag to scratch off the cover</span></h2>
+      <div class="demo-text mono reveal-text"
+           data-effect="none"
+           data-reveal-color="#FFFFFF"
+           data-reveal-radius="50"
+           data-reveal-fringe="80"
+           data-reveal="Wherever your cursor has come within scratch range of a glyph on this page, the hidden layer below quietly takes that glyph place — same font, same alignment, only a different color — letting you read both the surface story you came in here for and the secret one waiting silently beneath it for the right cursor sweep to finally expose it. None of these revealed positions ever switches back to the cover above; once your hand has brushed near them, the cover layer is gone for good and the underlying glyph stays put forever, no matter how long it has been since you moved across it. Drag slowly to scratch a tight line of mint-tinted ghosts under your hand, drag fast to leave a stippled wake of revealed words spread across this dim paragraph that will not change again. Refresh this page when you want a clean slate, ready to scratch off a fresh new lottery ticket from the start one more time.">
+        ######## #### ###### ### #### ###### ####### ##### ## # ##### ## #### ##### ### ###### ##### ##### ####### ##### #### ##### ##### # #### ##### #### ########## #### # ######### ##### # ####### ### #### #### ### ####### ##### ### #### ## #### ### ### ### ###### ### ####### ######## ####### ## ### ### ##### ###### ##### ## ####### ###### ### #### ## ##### ######## ######### #### ######## #### ## ### ##### ###### #### #### #### ### ####### #### ##### ### ##### ##### ## #### ### #### ### ### ########## ##### ##### ### ######## ## ###### ### #### ## ### #### ##### ### ##### ###### ### #### ###### ## ####### # ##### #### ## ########### ###### ##### #### ##### #### #### ## ##### # ######## #### ## ######## ##### ###### ###### #### ### ######### #### #### ### ###### ###### ####### #### #### #### ### #### # ##### ###### ##### ## ####### ### # ##### ### ####### ###### #### ### ##### ### #### #####
       </div>
     </article>
 
@@ -109,6 +142,7 @@
             <option>wake</option>
             <option>glow</option>
             <option>ripple</option>
+            <option>redact</option>
           </select>
         </label>
         <label>falloff
@@ -151,6 +185,19 @@
         strength: +el.dataset.strength || 30,
         falloff: el.dataset.falloff || 'gaussian',
       };
+      // Optional reveal-layer knobs — only set when the attribute is present
+      // so unspecified instances stay on the library defaults.
+      if (el.dataset.revealMode)   opts.revealMode   = el.dataset.revealMode;
+      if (el.dataset.revealColor)  opts.revealColor  = el.dataset.revealColor;
+      if (el.dataset.revealRadius) opts.revealRadius = +el.dataset.revealRadius;
+      if (el.dataset.revealFringe) opts.revealFringe = +el.dataset.revealFringe;
+      if (el.dataset.revealHoldMs) opts.revealHoldMs = +el.dataset.revealHoldMs;
+      // Redact knobs — same pattern.
+      if (el.dataset.redactRadius)       opts.redactRadius       = +el.dataset.redactRadius;
+      if (el.dataset.redactFringe)       opts.redactFringe       = +el.dataset.redactFringe;
+      if (el.dataset.redactTurnoverMs)   opts.redactTurnoverMs   = +el.dataset.redactTurnoverMs;
+      if (el.dataset.redactTurnoverFrac) opts.redactTurnoverFrac = +el.dataset.redactTurnoverFrac;
+      if (el.dataset.redactColor)        opts.redactColor        = el.dataset.redactColor;
       instances.set(el, new TextRippling(el, opts));
     }
 

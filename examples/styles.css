@@ -128,6 +128,45 @@ body {
   color: #5a5a62;
 }
 
+.reveal-card,
+.waverev-card {
+  grid-column: 1 / -1;
+  min-height: 540px;
+}
+
+.redact-card {
+  grid-column: 1 / -1;
+  min-height: 360px;
+}
+
+.redact-card .demo-text {
+  font-size: 18px;
+  line-height: 1.7;
+  /* Mid-tone base — solid blocks read clearly against it without
+     overpowering the surrounding (still-visible) prose. */
+  color: #c8c8cc;
+}
+
+.waverev-card .demo-text {
+  font-size: 18px;
+  line-height: 1.7;
+  /* Same dim cover as reveal — the binary state contrast (dim `#` vs
+     white revealed glyph) is what carries the dithering. The wave is
+     reversible, so the `#` cover comes back after the wake decays. */
+  color: dimgray;
+}
+
+.reveal-card .demo-text {
+  font-size: 18px;
+  line-height: 1.7;
+  /* The cover layer is a uniform `#` block in dimgray — looks like a
+     scratch-card surface. Each `#` reveals to a real letter in white
+     (set via data-reveal-color="#FFFFFF") under the cursor. The reveal
+     is sticky — chars stay in the white revealed layer for the lifetime
+     of the instance, so the paragraph fills in piece by piece. */
+  color: dimgray;
+}
+
 .label-note {
   color: #4a4a52;
   font-weight: 400;
