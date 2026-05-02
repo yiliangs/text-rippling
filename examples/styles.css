@@ -129,9 +129,23 @@ body {
 }
 
 .reveal-card,
-.waverev-card {
+.waverev-card,
+.bloom-card {
   grid-column: 1 / -1;
   min-height: 540px;
+}
+
+.bloom-card .demo-text {
+  font-size: 18px;
+  line-height: 1.7;
+  /* Three-tier color contract for bloom-ripple (matches Renderer.colorAndGlowBloom):
+     - this CSS color is the unrevealed (cover) state — dark gray;
+     - data-reveal-color (#8a8a92) is the revealed-static state — medium gray;
+     - data-wake-color default (#fff) is the ripple peak — white.
+     The cover dots silhouette the eventual prose; sweep your cursor across
+     and words bloom into legibility, then ripple keeps washing color across
+     them as the wave continues to pass. */
+  color: #4a4a52;
 }
 
 .redact-card {
