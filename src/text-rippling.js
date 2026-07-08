@@ -35,6 +35,9 @@
 //   │                   driven, latches once and stays                  │
 //   │   WaveReveal    — reversible two-layer overlay; wave-amplitude    │
 //   │                   driven, dithered per-char threshold (Ripple)    │
+//   │   BurnReveal    — paper-burn reveal of the element's own text     │
+//   │                   from under a twinkling procedural mask; per-    │
+//   │                   char heat field + creeping smolder front        │
 //   │   Color         — parse / lerp utilities                        │
 //   └─────────────────────────────────────────────────────────────────┘
 
@@ -572,6 +575,239 @@
       wordWaveFrame(chars, ctx, opts, true, Infinity);
     },
   };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  BurnReveal — paper-burn reveal over a twinkling ASCII mask ('burn').
+  //
+  //  Inverts the family's authoring contract: the other reveal modes
+  //  treat the element's HTML as the visible surface and `revealText` /
+  //  `data-reveal` as the hidden layer, but here the surface is
+  //  PROCEDURAL — every char is covered by a random glyph drawn from
+  //  `glyphPool` — so the element's own text IS the hidden payload and
+  //  `revealText` is not consulted. (Side benefit: the real prose stays
+  //  in the DOM for copy/paste, screen readers, and search.)
+  //
+  //  Three cooperating behaviors:
+  //
+  //  1. TWINKLE — unburned mask glyphs re-roll at slow randomized
+  //     intervals (mean `burnTwinkleMs`), like stars; the hotter a
+  //     char gets, the faster it flickers.
+  //
+  //  2. BURN — a per-char heat scalar in [0,1], integrated per frame
+  //     from two inputs:
+  //       cursor  : heat/s = burnRate · prox^FOCUS inside burnRadius —
+  //                 chars under the pointer combust near-instantly,
+  //                 chars at the fringe only warm up.
+  //       smolder : chars at/above `burnIgnite` (the kindling point)
+  //                 self-sustain at the full smolder rate and radiate
+  //                 to neighbors within `burnSmolderReach`.
+  //     There is NO extinction: once anything is burning, the front
+  //     keeps creeping — however slowly — until it runs out of
+  //     reachable text. `burnIgnite` is the point of no return; below
+  //     it a char cools back off when nothing within reach is
+  //     radiating (a grazed char glows faintly and fades; one the
+  //     fire reaches inevitably completes). Heat reaching 1 is
+  //     permanent (paper doesn't unburn) — the char latches
+  //     c.revealed and shows its own glyph.
+  //
+  //  3. BLOOM-RIPPLE ADOPTION — burned chars join the bloom-ripple
+  //     color contract (static `revealColor` at rest, lerped toward
+  //     `wakeColor` by ripple brightness — pair with effect: 'ripple').
+  //     The dedicated writer (burnColorWriter below) prepends two hot
+  //     states: cover→ember by heat while burning, then an ember→
+  //     revealColor cooling flash over `burnCoolMs` right after
+  //     combustion. Chars still cooling also keep radiating, which is
+  //     how a fully burned char hands the fire onward.
+  //
+  //  Mask glyphs are swapped in-slot (same caveat as scramble, but
+  //  persistent): proportional fonts jitter layout — use monospace.
+  //
+  //  Char fields owned (via initChar): burnHeat, burnedAt, maskGlyph,
+  //  nextTwinkle. Also drives the shared c.revealed latch.
+  // ════════════════════════════════════════════════════════════════════
+
+  const BurnReveal = {
+    // Physical tuning constants — DEFAULTS mirrors these under `burn*`
+    // keys so the numbers are owned in one place (same pattern as Ripple).
+    DEFAULTS: {
+      radius:       90,        // px — cursor ignition reach
+      rate:         6,         // heat/s at cursor center (heat 1 = burned through)
+      smolderRate:  0.35,      // heat/s — self-burn past ignition; also scales neighbor radiation.
+                               // Sets the front's creep speed (~1-2 chars/s at default): the
+                               // "microburn" pace at which the fire eats on after the cursor leaves
+      smolderReach: 40,        // px — radiation reach; must clear one line-height to spread vertically
+      ignite:       0.22,      // heat threshold — below: warmth cools off; at/above: self-sustains
+      coolMs:       700,       // ms — post-combustion ember flash; char keeps radiating during it
+      emberColor:   '#ff9a3c', // CSS color of the burning edge
+      twinkleMs:    2400,      // ms — mean interval between mask glyph re-rolls
+    },
+
+    // Internal constants (not knobs).
+    COOL_RATE: 0.3,  // heat/s lost when nothing is feeding a sub-ignition char
+    FOCUS:     2.2,  // cursor proximity exponent — "way faster" close to the flame
+    MAX_DT:    50,   // ms — per-frame integration clamp (tab-switch dt spikes)
+
+    // Per-char field ownership (see Char.create hand-off).
+    initChar(c) {
+      c.burnHeat = 0;
+      c.burnedAt = 0;
+      c.maskGlyph = null;
+      c.nextTwinkle = 0;
+    },
+
+    // (Re)start the mode: reset burn state and mask every char NOW —
+    // waiting for the first tick would flash one frame of the payload
+    // text. Called from the constructor and on revealMode switches.
+    attach(chars, opts) {
+      for (const c of chars) {
+        c.burnHeat = 0;
+        c.burnedAt = 0;
+        c.revealed = false;
+        c.maskGlyph = burnMaskGlyph(opts.glyphPool, null);
+        c.nextTwinkle = 0; // frame() staggers the first re-roll
+        c.textEl.textContent = c.maskGlyph;
+      }
+    },
+
+    // Lifecycle hook for TextRippling.update() — mask on entry; on exit
+    // clear the burn state so revealed latches don't leak into the next
+    // mode's writer (the new mode's naturalGlyph resolver restores the
+    // original glyphs on its first tick).
+    onUpdate(prev, curr, chars) {
+      if (prev.revealMode !== 'burn' && curr.revealMode === 'burn') {
+        BurnReveal.attach(chars, curr);
+      } else if (prev.revealMode === 'burn' && curr.revealMode !== 'burn') {
+        for (const c of chars) {
+          c.burnHeat = 0;
+          c.burnedAt = 0;
+          c.revealed = false;
+        }
+      }
+    },
+
+    // Per-frame orchestrator. Two passes:
+    //   1. bucket radiators (burning chars + fresh embers) into a coarse
+    //      grid, pitch = smolderReach, so the neighbor query in pass 2
+    //      touches only the 9 surrounding cells;
+    //   2. per unburned char: integrate cursor + smolder heat, handle
+    //      ignition/cooling/completion, and run the twinkle.
+    frame(chars, ctx, opts) {
+      const now = ctx.time;
+      const dt = ctx.dt < BurnReveal.MAX_DT ? ctx.dt : BurnReveal.MAX_DT;
+      const R = opts.burnRadius;
+      const RSq = R * R;
+      const reach = opts.burnSmolderReach;
+      const reachSq = reach * reach;
+      const ignite = opts.burnIgnite;
+      const kCursor = (opts.burnRate / 1000) * dt;
+      const kSmolder = (opts.burnSmolderRate / 1000) * dt;
+      const kCool = (BurnReveal.COOL_RATE / 1000) * dt;
+
+      _burnGrid.clear();
+      let radiators = 0;
+      for (let i = 0; i < chars.length; i++) {
+        const c = chars[i];
+        const radiating = c.revealed
+          ? now - c.burnedAt < opts.burnCoolMs
+          : c.burnHeat >= ignite;
+        if (!radiating) continue;
+        const key = ((c.hx / reach) | 0) * 8192 + ((c.hy / reach) | 0);
+        const bucket = _burnGrid.get(key);
+        if (bucket) bucket.push(c); else _burnGrid.set(key, [c]);
+        radiators++;
+      }
+
+      for (let i = 0; i < chars.length; i++) {
+        const c = chars[i];
+        if (c.revealed) continue;
+
+        let input = 0;
+
+        // Cursor: the flame itself. Superlinear proximity ramp so the
+        // center combusts near-instantly while the fringe only warms.
+        const dx = c.hx - ctx.mouseX;
+        const dy = c.hy - ctx.mouseY;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < RSq) {
+          const prox = 1 - Math.sqrt(d2) / R;
+          input += kCursor * Math.pow(prox, BurnReveal.FOCUS);
+        }
+
+        // Smolder: radiation from burning neighbors. Contributions sum
+        // (a wider front burns hotter) but are capped so a dense blaze
+        // can't skip the burn animation entirely.
+        if (radiators > 0) {
+          const cx = (c.hx / reach) | 0;
+          const cy = (c.hy / reach) | 0;
+          let seed = 0;
+          for (let gx = cx - 1; gx <= cx + 1; gx++) {
+            for (let gy = cy - 1; gy <= cy + 1; gy++) {
+              const bucket = _burnGrid.get(gx * 8192 + gy);
+              if (!bucket) continue;
+              for (let b = 0; b < bucket.length; b++) {
+                const r = bucket[b];
+                const rdx = r.hx - c.hx;
+                const rdy = r.hy - c.hy;
+                const rd2 = rdx * rdx + rdy * rdy;
+                if (rd2 >= reachSq) continue;
+                seed += 1 - Math.sqrt(rd2) / reach;
+              }
+            }
+          }
+          if (seed > 0) {
+            if (seed > 1.4) seed = 1.4;
+            // Per-char jitter keeps the creeping front ragged.
+            input += kSmolder * seed * (0.7 + c.seed * 0.6);
+          }
+        }
+
+        // Past the kindling point a char self-sustains at the full
+        // smolder rate — the microburn that keeps the edge advancing
+        // long after the cursor has moved on. No extinction, no decay:
+        // the fire only ends when it runs out of reachable text.
+        if (c.burnHeat >= ignite) input += kSmolder;
+
+        if (input > 0) {
+          c.burnHeat += input;
+          if (c.burnHeat >= 1) {
+            // Burned through — permanent. The glyph renderer swaps in
+            // the payload char this same tick via burnNaturalGlyph.
+            c.burnHeat = 1;
+            c.revealed = true;
+            c.burnedAt = now;
+            continue;
+          }
+        } else if (c.burnHeat > 0) {
+          // Nothing burning within reach and no flame — sub-kindling
+          // warmth fades back to the cover state.
+          c.burnHeat -= kCool;
+          if (c.burnHeat < 0) c.burnHeat = 0;
+        }
+
+        // Twinkle — slow star-like re-roll; accelerates as the char heats.
+        if (c.nextTwinkle === 0) {
+          c.nextTwinkle = now + opts.burnTwinkleMs * (0.2 + Math.random());
+        } else if (now >= c.nextTwinkle) {
+          c.maskGlyph = burnMaskGlyph(opts.glyphPool, c.maskGlyph);
+          const base = opts.burnTwinkleMs * (0.5 + Math.random());
+          c.nextTwinkle = now + base * (1 - 0.85 * c.burnHeat);
+        }
+      }
+    },
+  };
+
+  // Draw a mask glyph from the pool, avoiding an immediate repeat so a
+  // twinkle is always a visible change. Falls back to '#' on an empty pool.
+  function burnMaskGlyph(pool, current) {
+    if (!pool || pool.length === 0) return current || '#';
+    let g = pool.charAt((Math.random() * pool.length) | 0);
+    if (g === current) g = pool.charAt((Math.random() * pool.length) | 0);
+    return g;
+  }
+
+  // Module-private radiator grid, reused frame-to-frame (same rationale
+  // as _wordScratch above).
+  const _burnGrid = new Map();
 
   // ════════════════════════════════════════════════════════════════════
   //  Redact — stochastic-density block redaction with morphing turnover.
@@ -1126,6 +1362,7 @@
       // Per-module field hand-off — see each module's initChar comment
       // for the field set it owns.
       RevealLayer.initChar(c);
+      BurnReveal.initChar(c);
       Redact.initChar(c);
       return c;
     },
@@ -1354,10 +1591,11 @@
 
   // ════════════════════════════════════════════════════════════════════
   //  Reveal mode strategy table. Each entry bundles (a) the per-frame
-  //  word orchestrator and (b) the per-char color writer that pairs
-  //  with it. _tick looks up one bundle by `opts.revealMode` and
-  //  dispatches through it — adding a new mode means adding one entry
-  //  here, not threading two parallel if-ladders through _tick.
+  //  word orchestrator, (b) the per-char color writer that pairs with
+  //  it, (c) the resting-glyph resolver, and (d) the scramble gate.
+  //  _tick looks up one bundle by `opts.revealMode` and dispatches
+  //  through it — adding a new mode means adding one entry here, not
+  //  threading parallel if-ladders through _tick.
   //
   //  The mode→writer pairing was previously implicit (a `isBloomRipple`
   //  flag in _tick chose the writer), which left it possible to add a
@@ -1367,7 +1605,9 @@
   //  Color writer signature: (c, x) where x is a per-frame ctx with
   //  resolved color endpoints — baseRgb, wakeRgb, wakeStr, revealRgb,
   //  revealStr (revealRgb/Str fall back to wakeRgb/Str when revealColor
-  //  is unset). Writers internally derive any per-char state they need.
+  //  is unset) — plus emberRgb/emberStr/emberHotRgb (burn mode), the
+  //  frame time, and the options bag. Writers internally derive any
+  //  per-char state they need.
   // ════════════════════════════════════════════════════════════════════
 
   // Default writer — paired with cursor and wave modes. Picks lerp
@@ -1388,10 +1628,65 @@
     Renderer.colorAndGlowBloom(c, x.revealRgb, x.wakeRgb, x.wakeStr);
   }
 
+  // Burn writer — paired with burn. Two hot states precede the
+  // bloom-ripple contract:
+  //   unburned, heat > 0  → cover→ember ramp by heat (the brightening
+  //                          edge; writeLitColor gives the same gamma +
+  //                          glow curve as every other lit path)
+  //   burned, cooling     → white-hot ember flash decaying to
+  //                          revealColor over burnCoolMs
+  //   burned, settled     → Renderer.colorAndGlowBloom — identical
+  //                          styling to bloom-ripple (static gray at
+  //                          rest, ripple washes toward wakeColor)
+  function burnColorWriter(c, x) {
+    if (!c.revealed) {
+      if (c.burnHeat > 0.01) {
+        writeLitColor(c.el, c.burnHeat, x.baseRgb, x.emberRgb, x.emberStr);
+        c.wasLit = true;
+        c.colorPinned = true;
+      } else if (c.wasLit || c.colorPinned) {
+        // Cooled back to cover — drop inline styles so CSS color shows.
+        c.el.style.color = '';
+        c.el.style.textShadow = '';
+        c.wasLit = false;
+        c.colorPinned = false;
+      }
+      return;
+    }
+    const age = x.time - c.burnedAt;
+    if (age < x.opts.burnCoolMs) {
+      // Leaving c.wasLit set hands off cleanly below: colorAndGlowBloom's
+      // wasLit branch settles the char to the static revealRgb.
+      writeLitColor(c.el, 1 - age / x.opts.burnCoolMs, x.revealRgb, x.emberHotRgb, x.emberStr);
+      c.wasLit = true;
+      c.colorPinned = true;
+      return;
+    }
+    Renderer.colorAndGlowBloom(c, x.revealRgb, x.wakeRgb, x.wakeStr);
+  }
+
+  // Per-mode resting-glyph resolvers — which char textEl settles on when
+  // not actively scrambling. The default shows the lower layer only for
+  // revealed chars; burn INVERTS the relationship (the procedural mask
+  // covers unrevealed chars, the element's own char is the payload).
+  function defaultNaturalGlyph(c) {
+    return c.revealed && c.revealChar != null ? c.revealChar : c.originalChar;
+  }
+  function burnNaturalGlyph(c) {
+    return c.revealed ? c.originalChar : (c.maskGlyph || c.originalChar);
+  }
+
+  // Per-mode scramble gates. Burn must suppress effect-driven scramble
+  // on masked chars: pickers derive from c.originalChar, so a wavefront
+  // case-flip would flash the hidden payload through the mask.
+  function scrambleAlways() { return true; }
+  function scrambleRevealedOnly(c) { return c.revealed; }
+
   const REVEAL_MODES = {
-    'cursor':       { frame: RevealLayer.frame, colorWriter: defaultColorWriter },
-    'wave':         { frame: WaveReveal.frame,  colorWriter: defaultColorWriter },
-    'bloom-ripple': { frame: BloomRipple.frame, colorWriter: bloomColorWriter  },
+    'cursor':       { frame: RevealLayer.frame, colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
+    'wave':         { frame: WaveReveal.frame,  colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
+    'bloom-ripple': { frame: BloomRipple.frame, colorWriter: bloomColorWriter,   naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
+    'burn':         { frame: BurnReveal.frame,  colorWriter: burnColorWriter,    naturalGlyph: burnNaturalGlyph,    scrambleOk: scrambleRevealedOnly },
   };
 
   // ════════════════════════════════════════════════════════════════════
@@ -1431,7 +1726,11 @@
     //   'bloom-ripple'     — sticky wave-driven bloom; pair with
     //                        effect: 'ripple' to stylize revealed words
     //                        (BloomRipple + Renderer.colorAndGlowBloom)
-    //   any other value    — neither runs (still allows revealText to be set
+    //   'burn'             — paper-burn reveal of the element's OWN text
+    //                        from under a twinkling procedural mask
+    //                        (BurnReveal; char-level, ignores revealText;
+    //                        pair with effect: 'ripple' for the styling)
+    //   any other value    — none runs (still allows revealText to be set
     //                        without effect, e.g., for plugin-driven reveal)
     revealMode:      'cursor',
     revealText:      '',        // lower-layer string (1:1 to upper's visible chars); '' disables the feature
@@ -1439,6 +1738,17 @@
     revealRadius:     60,       // px — chars within this distance of the cursor count as touched
     revealHoldMs:     3000,     // ms — wave mode: how long a word stays active past its last touched frame
     revealWordStepMs: 30,       // ms — per-char step for the outward bloom (and inverse-collapse) within a word
+    // Burn reveal — see BurnReveal module above. Active when revealMode:
+    // 'burn'. Physical constants are owned by BurnReveal.DEFAULTS and
+    // mirrored here under prefixed names (same pattern as ripple*).
+    burnRadius:       BurnReveal.DEFAULTS.radius,       // px — cursor ignition reach
+    burnRate:         BurnReveal.DEFAULTS.rate,         // heat/s at cursor center
+    burnSmolderRate:  BurnReveal.DEFAULTS.smolderRate,  // heat/s — self-burn + neighbor radiation scale
+    burnSmolderReach: BurnReveal.DEFAULTS.smolderReach, // px — radiation reach of a burning char
+    burnIgnite:       BurnReveal.DEFAULTS.ignite,       // 0..1 — kindling point; past it a char always completes
+    burnCoolMs:       BurnReveal.DEFAULTS.coolMs,       // ms — ember flash after combustion
+    burnEmberColor:   BurnReveal.DEFAULTS.emberColor,   // CSS color of the burning edge
+    burnTwinkleMs:    BurnReveal.DEFAULTS.twinkleMs,    // ms — mean mask re-roll interval
     // Redact effect — see Redact module above. Active when effect: 'redact'.
     // Visual is a CSS background bar painted on a per-char cover layer
     // (see Splitter banner) — no glyph swap, so redaction is layout- and
@@ -1477,6 +1787,7 @@
       this._baseColorRgb = null;
       this._wakeCache = null;
       this._revealCache = null;
+      this._emberCache = null;
       this._ro = null;
       this._springAccum = 0;
       this._redactNextTurn = 0;
@@ -1485,6 +1796,7 @@
 
       this._captureBaseColor();
       RevealLayer.attach(this._chars, this.options, element);
+      if (this.options.revealMode === 'burn') BurnReveal.attach(this._chars, this.options);
       this._measure();
       this._bind();
 
@@ -1508,6 +1820,7 @@
       Object.assign(this.options, options);
       this._wakeCache = null;
       this._revealCache = null;
+      this._emberCache = null;
       // Reveal-mode change: c.colorPinned and c.wasLit have different
       // invariants per writer (defaultColorWriter treats colorPinned as
       // "revealed-and-painted-with-revealColor"; bloomColorWriter treats
@@ -1522,6 +1835,7 @@
       // means adding one onUpdate call here, not threading another
       // prev/curr stash through the body.
       RevealLayer.onUpdate(prev, this.options, this._chars, this.element);
+      BurnReveal.onUpdate(prev, this.options, this._chars);
       Redact.onUpdate(prev, this.options, this._chars);
     }
 
@@ -1595,11 +1909,26 @@
         const r = Color.parse(opts.revealColor);
         this._revealCache = { rgb: r, str: `${r[0]},${r[1]},${r[2]}` };
       }
+      // Ember endpoints for burn mode — parsed once like the other color
+      // caches. `hot` is the combustion-flash color (ember pushed toward
+      // white); the cooling ramp decays from it back to revealColor.
+      if (!this._emberCache) {
+        const e = Color.parse(opts.burnEmberColor);
+        this._emberCache = {
+          rgb: e,
+          str: `${e[0]},${e[1]},${e[2]}`,
+          hot: [
+            (e[0] + (255 - e[0]) * 0.45) | 0,
+            (e[1] + (255 - e[1]) * 0.45) | 0,
+            (e[2] + (255 - e[2]) * 0.45) | 0,
+          ],
+        };
+      }
       const wakeRgb = this._wakeCache.rgb;
       const wakeStr = this._wakeCache.str;
       const baseRgb = this._baseColorRgb || [200, 200, 200];
 
-      const ctx = makeContext(now);
+      const ctx = makeContext(now, dt);
       ctx.frameId = ++this._frameId;
       const r = opts.radius;
       const rCutoffSq = (r * 2) * (r * 2);
@@ -1624,16 +1953,19 @@
         this._redactNextTurn = now + opts.redactTurnoverMs;
       }
 
-      // Reveal: look up the (frame, colorWriter) bundle for this mode.
-      // The frame runs once per tick and sets c.revealed for every char;
-      // the writer is called per-char inside the loop below. Unknown
-      // mode → no frame runs and the default writer is used (this is
-      // how an effect-only instance with no reveal feature works —
-      // leave revealText empty so applyChar wouldn't latch anything
-      // anyway, and the writer's revealed branches stay dormant).
+      // Reveal: look up the mode bundle (frame, colorWriter, naturalGlyph,
+      // scrambleOk). The frame runs once per tick and sets c.revealed for
+      // every char; the other three are consulted per char inside the
+      // loop below. Unknown mode → no frame runs and the default writer/
+      // resolver/gate are used (this is how an effect-only instance with
+      // no reveal feature works — leave revealText empty so applyChar
+      // wouldn't latch anything anyway, and the writer's revealed
+      // branches stay dormant).
       const modeBundle = REVEAL_MODES[opts.revealMode];
       if (modeBundle) modeBundle.frame(this._chars, ctx, opts);
-      const colorWriter = modeBundle ? modeBundle.colorWriter : defaultColorWriter;
+      const colorWriter = modeBundle ? modeBundle.colorWriter  : defaultColorWriter;
+      const naturalOf   = modeBundle ? modeBundle.naturalGlyph : defaultNaturalGlyph;
+      const scrambleOk  = modeBundle ? modeBundle.scrambleOk   : scrambleAlways;
 
       // Per-frame color context — resolve endpoints once so the per-char
       // writer doesn't have to re-check this._revealCache for every glyph.
@@ -1644,6 +1976,11 @@
         wakeStr,
         revealRgb: this._revealCache ? this._revealCache.rgb : wakeRgb,
         revealStr: this._revealCache ? this._revealCache.str : wakeStr,
+        emberRgb:    this._emberCache.rgb,
+        emberStr:    this._emberCache.str,
+        emberHotRgb: this._emberCache.hot,
+        time: now,
+        opts,
       };
 
       for (const c of this._chars) {
@@ -1665,10 +2002,11 @@
         // underneath doesn't churn — the bar is opaque so it wouldn't
         // be visible anyway, but skipping the swap avoids needless DOM
         // writes and keeps the underlying char ready to re-emerge as
-        // its original self the moment the cover lifts.
-        const showLower      = c.revealed && c.revealChar != null;
-        const scrambleTarget = c.redacted ? 0 : (target.scramble || 0);
-        const naturalGlyph   = showLower ? c.revealChar : c.originalChar;
+        // its original self the moment the cover lifts. The mode's
+        // scramble gate can veto too (burn: masked chars must never
+        // case-flip, which would leak the hidden payload).
+        const scrambleTarget = (c.redacted || !scrambleOk(c)) ? 0 : (target.scramble || 0);
+        const naturalGlyph   = naturalOf(c);
 
         Renderer.transform(c);
         colorWriter(c, colorCtx);
@@ -1682,7 +2020,7 @@
   //  Tick helpers — kept outside the class so the hot loop stays readable.
   // ════════════════════════════════════════════════════════════════════
 
-  function makeContext(now) {
+  function makeContext(now, dt) {
     // Convert the cursor sample (client-space, as the browser delivers it)
     // into page space here so every effect sees a single coord convention
     // — same space as `c.hx/hy` and `CursorField.stamps`. mouseVx/Vy stay
@@ -1696,6 +2034,10 @@
       mouseVx: CursorField.state.vx,
       mouseVy: CursorField.state.vy,
       time:    now,
+      // Frame delta (ms) for modules that integrate per-frame rates
+      // (BurnReveal's heat field). Effects get their dt-correction via
+      // the spring accumulator / brightness lerp instead.
+      dt:      dt,
       stamps:  CursorField.state.stamps,
       // Per-frame instance counter. wordWaveFrame stamps it onto each
       // char's Ripple memo; Effects.ripple compares to know if the
@@ -1782,6 +2124,10 @@
   // BloomRipple — public API: .frame(chars, ctx, opts) for the wave-driven
   // sticky bloom that pairs with effect: 'ripple' for styled revealed text.
   TextRippling.bloomRipple  = BloomRipple;
+  // BurnReveal — public API: .frame(chars, ctx, opts) for the paper-burn
+  // reveal ('burn' mode); .attach(chars, opts) re-masks and resets the
+  // burn state (a fresh sheet of paper).
+  TextRippling.burnReveal   = BurnReveal;
   // Redact is exposed for plugin authors that want to drive the
   // stochastic block redaction directly (skip Effects.redact dispatch).
   TextRippling.redact       = Redact;
@@ -1803,6 +2149,7 @@
     module.exports.revealLayer   = RevealLayer;
     module.exports.waveReveal    = WaveReveal;
     module.exports.bloomRipple   = BloomRipple;
+    module.exports.burnReveal    = BurnReveal;
     module.exports.redact        = Redact;
     module.exports.version       = VERSION;
   }

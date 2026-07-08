@@ -14,6 +14,7 @@ export const wordReveal   = TextRippling.wordReveal;
 export const revealLayer  = TextRippling.revealLayer;
 export const waveReveal   = TextRippling.waveReveal;
 export const bloomRipple  = TextRippling.bloomRipple;
+export const burnReveal   = TextRippling.burnReveal;
 export const redact       = TextRippling.redact;
 export const rippleAll    = TextRippling.rippleAll;
 export default TextRippling;
