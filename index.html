@@ -123,6 +123,16 @@
       </div>
     </article>
 
+    <article class="card burn-card">
+      <h2 class="label">burn <span class="label-note">— paper-burn reveal over a twinkling ascii mask</span></h2>
+      <div class="demo-text mono burn-text"
+           data-effect="ripple"
+           data-reveal-mode="burn"
+           data-reveal-color="#8a8a92">
+        Every character in this paragraph is real text — no hidden layer, no length-matched cover string — masked in place by a random ascii glyph that drifts to another form every few seconds, slow as stars. Hold your cursor anywhere and the page catches: directly under the pointer the mask burns through almost instantly, while glyphs at the edge of reach only warm up and glow. The bright ember line between burned and unburned is the combustion front, and it keeps creeping outward on its own after your hand has moved away — a slow microburn that nothing puts out: leave it alone and it will patiently take the whole page down to its hidden text. What has burned stays burned; the words underneath settle at reading gray, and because the ripple effect is layered on top, every stroke you trace keeps washing light through everything the fire has already uncovered.
+      </div>
+    </article>
+
     <article class="card reveal-card">
       <h2 class="label">reveal <span class="label-note">— drag to scratch off the cover</span></h2>
       <div class="demo-text mono reveal-text"
@@ -209,6 +219,14 @@
       if (el.dataset.redactTurnoverMs)   opts.redactTurnoverMs   = +el.dataset.redactTurnoverMs;
       if (el.dataset.redactTurnoverFrac) opts.redactTurnoverFrac = +el.dataset.redactTurnoverFrac;
       if (el.dataset.redactColor)        opts.redactColor        = el.dataset.redactColor;
+      // Burn knobs — same pattern.
+      if (el.dataset.burnRadius)       opts.burnRadius       = +el.dataset.burnRadius;
+      if (el.dataset.burnRate)         opts.burnRate         = +el.dataset.burnRate;
+      if (el.dataset.burnSmolderRate)  opts.burnSmolderRate  = +el.dataset.burnSmolderRate;
+      if (el.dataset.burnSmolderReach) opts.burnSmolderReach = +el.dataset.burnSmolderReach;
+      if (el.dataset.burnCoolMs)       opts.burnCoolMs       = +el.dataset.burnCoolMs;
+      if (el.dataset.burnEmberColor)   opts.burnEmberColor   = el.dataset.burnEmberColor;
+      if (el.dataset.burnTwinkleMs)    opts.burnTwinkleMs    = +el.dataset.burnTwinkleMs;
       instances.set(el, new TextRippling(el, opts));
     }
 

@@ -130,9 +130,23 @@ body {
 
 .reveal-card,
 .waverev-card,
-.bloom-card {
+.bloom-card,
+.burn-card {
   grid-column: 1 / -1;
   min-height: 540px;
+}
+
+.burn-card .demo-text {
+  font-size: 18px;
+  line-height: 1.7;
+  /* Color contract for burn mode (matches burnColorWriter):
+     - this CSS color is the unburned twinkling-mask state — dark gray;
+     - the burning edge ramps from it toward the ember orange
+       (data-burn-ember-color, default #ff9a3c), flashing white-hot
+       at combustion;
+     - burned text settles at data-reveal-color (#8a8a92) and ripples
+       toward wake white as strokes pass over it. */
+  color: #4a4a52;
 }
 
 .bloom-card .demo-text {
