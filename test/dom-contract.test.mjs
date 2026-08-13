@@ -243,6 +243,11 @@ test('splits collapsed whitespace and Unicode code points into the nested slot c
     assert.deepEqual([rippling._chars[2].indexInWord, rippling._chars[3].indexInWord], [0, 1]);
 
     const slot = rippling._chars[0];
+    const seedIndex = Object.keys(slot).indexOf('seed');
+    assert.deepEqual(Object.keys(slot).slice(seedIndex, seedIndex + 4), [
+      'seed', '_rippleStash', '_rippleStashFrame', 'revealChar',
+    ]);
+    assert.deepEqual([slot._rippleStash, slot._rippleStashFrame], [null, -1]);
     assert.equal(slot.el.parentNode.className, 'tr-char-word');
     assert.deepEqual(
       [slot.el.parentNode.style.display, slot.el.parentNode.style.whiteSpace],

@@ -1,5 +1,5 @@
 import { REST } from './constants.js';
-import { Ripple } from './ripple.js';
+import { RippleSampler } from './ripple-sampler.js';
 
 // ════════════════════════════════════════════════════════════════════
 //  Falloffs — distance-to-radius weighting curves, range [0..1].
@@ -110,14 +110,7 @@ const Effects = {
   // mismatch → stash is from a previous frame (or never populated, e.g.
   // cursor mode) → recompute as before.
   ripple(dx, dy, dist, f, p, ctx) {
-    const c = ctx.char;
-    if (c && c._rippleStashFrame === ctx.frameId) {
-      return c._rippleStash || REST;
-    }
-    return Ripple.compute(
-      ctx.charX, ctx.charY, ctx.time, ctx.stamps,
-      p.rippleSpeed, p.rippleSpatialAtten, p.ripplePostHit, p.rippleEdge,
-    ) || REST;
+    return RippleSampler.sampleForEffect(ctx, p) || REST;
   },
 };
 

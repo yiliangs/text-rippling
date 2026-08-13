@@ -1,6 +1,7 @@
 import { REF_DT_MS } from './constants.js';
 import { FeatureLifecycle } from './feature-lifecycle.js';
 import { WordReveal } from './features/reveal.js';
+import { RippleSampler } from './ripple-sampler.js';
 
 // ════════════════════════════════════════════════════════════════════
 //  Splitter — text → Char[].
@@ -136,13 +137,10 @@ const Char = {
       originalChar,
       // Deterministic seed for effects/strategies that want per-char jitter.
       seed: Math.random(),
-      // Per-frame Ripple.compute memo. wordWaveFrame populates this
-      // when it runs (wave / bloom-ripple modes); Effects.ripple checks
-      // _rippleStashFrame === ctx.frameId before recomputing. Pre-init
-      // both fields so V8 keeps the Char shape monomorphic.
-      _rippleStash: null,
-      _rippleStashFrame: -1,
     };
+    // Keep sampler fields before feature fields so every Char has the same
+    // stable property order as before this ownership move.
+    RippleSampler.initChar(c);
     // Per-module field hand-off. The lifecycle owns the fixed order;
     // each feature's public initChar hook still owns its own fields.
     FeatureLifecycle.initChar(c);

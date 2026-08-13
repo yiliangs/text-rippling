@@ -464,6 +464,37 @@
     },
   };
 
+  // Owns the internal memo protocol shared by wave reveal and the ripple effect.
+  // Reveal sampling refreshes the memo; effect sampling only consumes an exact-
+  // frame memo and otherwise computes from the effect context without caching.
+  const RippleSampler = {
+    initChar(c) {
+      c._rippleStash = null;
+      c._rippleStashFrame = -1;
+    },
+
+    sampleForReveal(c, ctx, opts) {
+      const sample = compute(c.hx, c.hy, ctx, opts);
+      c._rippleStash = sample;
+      c._rippleStashFrame = ctx.frameId;
+      return sample;
+    },
+
+    sampleForEffect(ctx, opts) {
+      const c = ctx.char;
+      if (c && c._rippleStashFrame === ctx.frameId) return c._rippleStash;
+      return compute(ctx.charX, ctx.charY, ctx, opts);
+    },
+  };
+
+  function compute(charX, charY, ctx, opts) {
+    return Ripple.compute(
+      charX, charY, ctx.time, ctx.stamps,
+      opts.rippleSpeed, opts.rippleSpatialAtten,
+      opts.ripplePostHit, opts.rippleEdge,
+    );
+  }
+
   // ════════════════════════════════════════════════════════════════════
   //  WordReveal — shared word-level reveal orchestration.
   //
@@ -761,13 +792,7 @@
         // when the char is inside cursor proximity (touched=true here)
         // we skip the call entirely — Effects.ripple will recompute
         // for that handful of chars, which is negligible vs the bulk.
-        const r = Ripple.compute(
-          c.hx, c.hy, ctx.time, ctx.stamps,
-          opts.rippleSpeed, opts.rippleSpatialAtten,
-          opts.ripplePostHit, opts.rippleEdge,
-        );
-        c._rippleStash = r;
-        c._rippleStashFrame = ctx.frameId;
+        const r = RippleSampler.sampleForReveal(c, ctx, opts);
         if (r && r.brightness > c.seed) touched = true;
       }
       if (touched) WordReveal.touch(c, distSq);
@@ -1130,14 +1155,7 @@
     // mismatch → stash is from a previous frame (or never populated, e.g.
     // cursor mode) → recompute as before.
     ripple(dx, dy, dist, f, p, ctx) {
-      const c = ctx.char;
-      if (c && c._rippleStashFrame === ctx.frameId) {
-        return c._rippleStash || REST;
-      }
-      return Ripple.compute(
-        ctx.charX, ctx.charY, ctx.time, ctx.stamps,
-        p.rippleSpeed, p.rippleSpatialAtten, p.ripplePostHit, p.rippleEdge,
-      ) || REST;
+      return RippleSampler.sampleForEffect(ctx, p) || REST;
     },
   };
 
@@ -1430,13 +1448,10 @@
         originalChar,
         // Deterministic seed for effects/strategies that want per-char jitter.
         seed: Math.random(),
-        // Per-frame Ripple.compute memo. wordWaveFrame populates this
-        // when it runs (wave / bloom-ripple modes); Effects.ripple checks
-        // _rippleStashFrame === ctx.frameId before recomputing. Pre-init
-        // both fields so V8 keeps the Char shape monomorphic.
-        _rippleStash: null,
-        _rippleStashFrame: -1,
       };
+      // Keep sampler fields before feature fields so every Char has the same
+      // stable property order as before this ownership move.
+      RippleSampler.initChar(c);
       // Per-module field hand-off. The lifecycle owns the fixed order;
       // each feature's public initChar hook still owns its own fields.
       FeatureLifecycle.initChar(c);

@@ -61,6 +61,16 @@ function withRandom(values, operation) {
   }
 }
 
+function withRippleCompute(compute, operation) {
+  const original = commonJs.ripple.compute;
+  commonJs.ripple.compute = compute;
+  try {
+    return operation();
+  } finally {
+    commonJs.ripple.compute = original;
+  }
+}
+
 function makeWord(length) {
   const chars = Array.from({ length }, (_, indexInWord) => ({
     indexInWord,
@@ -70,6 +80,47 @@ function makeWord(length) {
   const word = commonJs.wordReveal.makeWord(chars);
   for (const char of chars) char.wordState = word;
   return { chars, word };
+}
+
+function makeWaveChar(overrides = {}) {
+  const char = {
+    hx: 10,
+    hy: 20,
+    indexInWord: 0,
+    revealChar: 'R',
+    revealed: false,
+    seed: 1,
+    wordState: null,
+    _rippleStash: null,
+    _rippleStashFrame: -1,
+    ...overrides,
+  };
+  char.wordState = commonJs.wordReveal.makeWord([char]);
+  return char;
+}
+
+const RIPPLE_OPTIONS = {
+  revealHoldMs: 50,
+  revealRadius: 5,
+  revealWordStepMs: 10,
+  rippleSpeed: 2,
+  rippleSpatialAtten: 3,
+  ripplePostHit: 4,
+  rippleEdge: 5,
+};
+
+function makeRippleContext(char, overrides = {}) {
+  return {
+    char,
+    charX: 101,
+    charY: 202,
+    frameId: 7,
+    mouseX: -1000,
+    mouseY: -1000,
+    stamps: [{ x: 1, y: 2, t0: 3 }],
+    time: 40,
+    ...overrides,
+  };
 }
 
 test('CommonJS and ESM expose their exact public shapes', () => {
@@ -88,6 +139,12 @@ test('CommonJS and ESM expose their exact public shapes', () => {
   assert.equal(Object.hasOwn(esm, 'featureLifecycle'), false);
   assert.equal(Object.hasOwn(PUBLIC_API, 'FeatureLifecycle'), false);
   assert.equal(Object.hasOwn(PUBLIC_API, 'featureLifecycle'), false);
+  assert.equal(Object.hasOwn(commonJs, 'RippleSampler'), false);
+  assert.equal(Object.hasOwn(commonJs, 'rippleSampler'), false);
+  assert.equal(Object.hasOwn(esm, 'RippleSampler'), false);
+  assert.equal(Object.hasOwn(esm, 'rippleSampler'), false);
+  assert.equal(Object.hasOwn(PUBLIC_API, 'RippleSampler'), false);
+  assert.equal(Object.hasOwn(PUBLIC_API, 'rippleSampler'), false);
   assert.equal(commonJs.cursor, commonJs.TextRippling.cursor);
 
   for (const key of ESM_KEYS) {
@@ -185,6 +242,7 @@ test('effects retain direction, scale, brightness, and deterministic scatter mat
 
 test('Ripple preserves the leading-frontier and passed-wake boundaries', () => {
   const ripple = commonJs.ripple;
+  assert.deepEqual(Object.keys(ripple), ['DEFAULTS', 'compute']);
   assert.deepEqual(ripple.DEFAULTS, {
     speed: 0.55,
     spatial: 180,
@@ -223,6 +281,109 @@ test('Ripple preserves the leading-frontier and passed-wake boundaries', () => {
   ], 1, 100, 100, 10);
   assert.equal(mixed.interior, true);
   assert.equal(mixed.scramble, 0);
+});
+
+test('wave reveal shares exact-frame ripple samples with the effect adapter', () => {
+  const sample = { brightness: 0.25, scramble: 0.5, interior: false };
+  const char = makeWaveChar();
+  const ctx = makeRippleContext(char);
+  let calls = 0;
+
+  withRippleCompute(() => {
+    calls++;
+    return sample;
+  }, () => {
+    commonJs.waveReveal.frame([char], ctx, RIPPLE_OPTIONS);
+    const effectSample = commonJs.effects.ripple(0, 0, 0, 0, RIPPLE_OPTIONS, ctx);
+
+    assert.equal(calls, 1);
+    assert.equal(char._rippleStash, sample);
+    assert.equal(char._rippleStashFrame, ctx.frameId);
+    assert.equal(effectSample, sample);
+  });
+
+  const quietChar = makeWaveChar();
+  const quietCtx = makeRippleContext(quietChar, { frameId: 8 });
+  calls = 0;
+  withRippleCompute(() => {
+    calls++;
+    return null;
+  }, () => {
+    commonJs.waveReveal.frame([quietChar], quietCtx, RIPPLE_OPTIONS);
+    const effectSample = commonJs.effects.ripple(0, 0, 0, 0, RIPPLE_OPTIONS, quietCtx);
+
+    assert.equal(calls, 1);
+    assert.equal(quietChar._rippleStash, null);
+    assert.equal(effectSample, commonJs.effects.none());
+  });
+});
+
+test('ripple effect cache misses recompute from context coordinates without writing', () => {
+  const staleSample = { brightness: 0.1, scramble: 0, interior: false };
+  const samples = [
+    { brightness: 0.2, scramble: 0, interior: false },
+    { brightness: 0.3, scramble: 0, interior: false },
+  ];
+  const char = makeWaveChar({
+    hx: 11,
+    hy: 22,
+    _rippleStash: staleSample,
+    _rippleStashFrame: 6,
+  });
+  const ctx = makeRippleContext(char, { frameId: 7 });
+  const calls = [];
+
+  withRippleCompute((...args) => {
+    calls.push(args);
+    return samples[calls.length - 1];
+  }, () => {
+    const first = commonJs.effects.ripple(0, 0, 0, 0, RIPPLE_OPTIONS, ctx);
+    const second = commonJs.effects.ripple(0, 0, 0, 0, RIPPLE_OPTIONS, ctx);
+
+    assert.equal(first, samples[0]);
+    assert.equal(second, samples[1]);
+  });
+
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(([x, y]) => x === ctx.charX && y === ctx.charY));
+  assert.ok(calls.every(([x, y]) => x !== char.hx && y !== char.hy));
+  assert.equal(char._rippleStash, staleSample);
+  assert.equal(char._rippleStashFrame, 6);
+});
+
+test('wave and bloom reveal always refresh their ripple memo', () => {
+  const samples = [
+    { brightness: 0, scramble: 0, interior: false },
+    null,
+    { brightness: 0, scramble: 0.1, interior: false },
+    { brightness: 0, scramble: 0.2, interior: false },
+  ];
+  const calls = [];
+
+  withRippleCompute((...args) => {
+    calls.push(args);
+    return samples[calls.length - 1];
+  }, () => {
+    const waveChar = makeWaveChar({ hx: 12, hy: 24 });
+    const waveCtx = makeRippleContext(waveChar, { frameId: 9 });
+    commonJs.waveReveal.frame([waveChar], waveCtx, RIPPLE_OPTIONS);
+    commonJs.waveReveal.frame([waveChar], waveCtx, RIPPLE_OPTIONS);
+    assert.equal(waveChar._rippleStash, null);
+    assert.equal(waveChar._rippleStashFrame, 9);
+
+    const bloomChar = makeWaveChar({ hx: 13, hy: 26 });
+    const bloomCtx = makeRippleContext(bloomChar);
+    delete bloomCtx.frameId;
+    commonJs.bloomRipple.frame([bloomChar], bloomCtx, RIPPLE_OPTIONS);
+    commonJs.bloomRipple.frame([bloomChar], bloomCtx, RIPPLE_OPTIONS);
+    assert.equal(bloomChar._rippleStash, samples[3]);
+    assert.equal(bloomChar._rippleStashFrame, undefined);
+  });
+
+  assert.equal(calls.length, 4);
+  assert.deepEqual(calls.map((args) => args.slice(0, 2)), [
+    [12, 24], [12, 24], [13, 26], [13, 26],
+  ]);
 });
 
 test('WordReveal blooms, collapses, and reactivates without clearing latched chars', () => {

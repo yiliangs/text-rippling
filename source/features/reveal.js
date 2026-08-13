@@ -1,4 +1,4 @@
-import { Ripple } from '../ripple.js';
+import { RippleSampler } from '../ripple-sampler.js';
 
 // ════════════════════════════════════════════════════════════════════
 //  WordReveal — shared word-level reveal orchestration.
@@ -297,13 +297,7 @@ function wordWaveFrame(chars, ctx, opts, sticky, holdMs) {
       // when the char is inside cursor proximity (touched=true here)
       // we skip the call entirely — Effects.ripple will recompute
       // for that handful of chars, which is negligible vs the bulk.
-      const r = Ripple.compute(
-        c.hx, c.hy, ctx.time, ctx.stamps,
-        opts.rippleSpeed, opts.rippleSpatialAtten,
-        opts.ripplePostHit, opts.rippleEdge,
-      );
-      c._rippleStash = r;
-      c._rippleStashFrame = ctx.frameId;
+      const r = RippleSampler.sampleForReveal(c, ctx, opts);
       if (r && r.brightness > c.seed) touched = true;
     }
     if (touched) WordReveal.touch(c, distSq);
