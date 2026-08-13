@@ -1,7 +1,6 @@
 import { REF_DT_MS } from './constants.js';
-import { BurnReveal } from './features/burn-reveal.js';
-import { Redact } from './features/redact.js';
-import { RevealLayer, WordReveal } from './features/reveal.js';
+import { FeatureLifecycle } from './feature-lifecycle.js';
+import { WordReveal } from './features/reveal.js';
 
 // ════════════════════════════════════════════════════════════════════
 //  Splitter — text → Char[].
@@ -144,11 +143,9 @@ const Char = {
       _rippleStash: null,
       _rippleStashFrame: -1,
     };
-    // Per-module field hand-off — see each module's initChar comment
-    // for the field set it owns.
-    RevealLayer.initChar(c);
-    BurnReveal.initChar(c);
-    Redact.initChar(c);
+    // Per-module field hand-off. The lifecycle owns the fixed order;
+    // each feature's public initChar hook still owns its own fields.
+    FeatureLifecycle.initChar(c);
     return c;
   },
 

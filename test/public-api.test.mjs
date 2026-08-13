@@ -6,6 +6,7 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const commonJs = require('..');
 const esm = await import('../src/text-rippling.mjs');
+const { PUBLIC_API } = await import('../source/public-api.js');
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
 
 const COMMON_JS_KEYS = [
@@ -81,6 +82,12 @@ test('CommonJS and ESM expose their exact public shapes', () => {
   assert.equal(esm.default, commonJs);
   assert.equal(esm.TextRippling, commonJs);
   assert.equal(Object.hasOwn(esm, 'cursor'), false);
+  assert.equal(Object.hasOwn(commonJs, 'FeatureLifecycle'), false);
+  assert.equal(Object.hasOwn(commonJs, 'featureLifecycle'), false);
+  assert.equal(Object.hasOwn(esm, 'FeatureLifecycle'), false);
+  assert.equal(Object.hasOwn(esm, 'featureLifecycle'), false);
+  assert.equal(Object.hasOwn(PUBLIC_API, 'FeatureLifecycle'), false);
+  assert.equal(Object.hasOwn(PUBLIC_API, 'featureLifecycle'), false);
   assert.equal(commonJs.cursor, commonJs.TextRippling.cursor);
 
   for (const key of ESM_KEYS) {

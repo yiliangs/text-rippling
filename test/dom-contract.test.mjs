@@ -369,6 +369,77 @@ test('update masks immediately on burn entry and restores natural glyphs on the 
   }
 });
 
+test('burn mode round-trip preserves stale word reveal activation', () => {
+  const rippling = new TextRippling(host('AB'), {
+    effect: 'none',
+    glyphPool: 'X',
+    revealMode: 'cursor',
+    revealRadius: 100,
+    revealText: 'YZ',
+    revealWordStepMs: 10,
+    remeasureOn: 'manual',
+  });
+
+  try {
+    const word = rippling._chars[0].wordState;
+    TextRippling.cursor.state.x = rippling._chars[0].hx;
+    TextRippling.cursor.state.y = rippling._chars[0].hy;
+    rippling._tick(100, 0);
+    rippling._tick(120, 0);
+    assert.ok(rippling._chars.every((char) => char.revealed));
+    assert.equal(word.active, true);
+    const activatedAt = word.activatedAt;
+
+    rippling.update({ revealMode: 'burn' });
+    assert.ok(rippling._chars.every((char) => !char.revealed));
+    assert.deepEqual([word.active, word.activatedAt], [true, activatedAt]);
+
+    rippling.update({ revealMode: 'cursor' });
+    assert.ok(rippling._chars.every((char) => !char.revealed));
+    assert.deepEqual([word.active, word.activatedAt], [true, activatedAt]);
+
+    TextRippling.cursor.state.x = -1e6;
+    TextRippling.cursor.state.y = -1e6;
+    rippling._tick(121, 0);
+    assert.ok(rippling._chars.every((char) => char.revealed));
+  } finally {
+    rippling.destroy();
+  }
+});
+
+test('revealText update during burn resets reveal state but retains heat', () => {
+  const rippling = new TextRippling(host('AB'), {
+    effect: 'none',
+    glyphPool: 'X',
+    revealMode: 'burn',
+    remeasureOn: 'manual',
+  });
+
+  try {
+    const char = rippling._chars[0];
+    const word = char.wordState;
+    TextRippling.wordReveal.resetScratch(word);
+    TextRippling.wordReveal.touch(char, 0);
+    TextRippling.wordReveal.tickWord(word, 40, Infinity, true);
+    char.burnHeat = 0.65;
+    char.burnedAt = 30;
+    char.revealed = true;
+
+    rippling.update({ revealText: 'YZ' });
+
+    assert.deepEqual(
+      [char.revealChar, char.revealed, char.burnHeat, char.burnedAt, char.textEl.textContent],
+      ['Y', false, 0.65, 30, 'X'],
+    );
+    assert.deepEqual(
+      [word.active, word.activatedAt, word.anchorIdx, word.lastTouchedAt],
+      [false, 0, 0, 0],
+    );
+  } finally {
+    rippling.destroy();
+  }
+});
+
 test('redact color updates immediately and effect-exit cleanup renders on the next tick', () => {
   const element = host('AB');
   const rippling = new TextRippling(element, {
@@ -619,43 +690,86 @@ test('reassigning options remains compatible with update and frame execution', (
   }
 });
 
-test('update retains explicit feature-hook order and destroy releases engine DOM refs', () => {
-  const modules = [
-    ['reveal', TextRippling.revealLayer],
-    ['burn', TextRippling.burnReveal],
-    ['redact', TextRippling.redact],
+test('feature lifecycle calls replaceable public hooks in exact order', () => {
+  const hookSpecs = [
+    ['reveal', TextRippling.revealLayer, ['initChar', 'attach', 'onUpdate']],
+    ['burn', TextRippling.burnReveal, ['initChar', 'attach', 'onUpdate']],
+    ['redact', TextRippling.redact, ['initChar', 'onUpdate']],
   ];
-  const originals = modules.map(([, module]) => module.onUpdate);
-  const order = [];
-  for (let i = 0; i < modules.length; i++) {
-    const [name, module] = modules[i];
-    const original = originals[i];
-    module.onUpdate = (...args) => {
-      order.push(name);
-      return original(...args);
-    };
-  }
-
-  const rippling = new TextRippling(host('A'), {
-    effect: 'none',
-    revealMode: 'none',
-    remeasureOn: 'manual',
-  });
-  const engine = rippling._engine;
-  const originalChars = rippling._chars;
+  const originals = [];
+  const calls = [];
+  let burnRippling = null;
+  let plainRippling = null;
 
   try {
-    rippling.update({ radius: 99 });
-    assert.deepEqual(order, ['reveal', 'burn', 'redact']);
+    for (const [name, module, hooks] of hookSpecs) {
+      for (const hook of hooks) {
+        const original = module[hook];
+        originals.push([module, hook, original]);
+        module[hook] = (...args) => {
+          calls.push({ label: `${name}.${hook}`, args });
+          if (name === 'reveal' && hook === 'onUpdate') {
+            assert.ok(args[2].every((char) => !char.colorPinned && !char.wasLit));
+          }
+          return original(...args);
+        };
+      }
+    }
 
-    rippling.destroy();
-    assert.deepEqual(rippling._chars, []);
+    const burnElement = host('A');
+    burnRippling = new TextRippling(burnElement, {
+      effect: 'none',
+      glyphPool: 'X',
+      revealMode: 'burn',
+      remeasureOn: 'manual',
+    });
+    assert.deepEqual(calls.map((call) => call.label), [
+      'reveal.initChar', 'burn.initChar', 'redact.initChar',
+      'reveal.attach', 'burn.attach',
+    ]);
+    assert.ok(calls.slice(0, 3).every((call) => (
+      call.args.length === 1 && call.args[0] === burnRippling._chars[0]
+    )));
+    assert.deepEqual(calls[3].args, [burnRippling._chars, burnRippling.options, burnElement]);
+    assert.deepEqual(calls[4].args, [burnRippling._chars, burnRippling.options]);
+
+    calls.length = 0;
+    burnRippling._chars[0].colorPinned = true;
+    burnRippling._chars[0].wasLit = true;
+    burnRippling.update({ revealMode: 'cursor' });
+    assert.deepEqual(calls.map((call) => call.label), [
+      'reveal.onUpdate', 'burn.onUpdate', 'redact.onUpdate',
+    ]);
+    assert.equal(calls[0].args.length, 4);
+    assert.deepEqual(calls[0].args.slice(1), [
+      burnRippling.options, burnRippling._chars, burnElement,
+    ]);
+    assert.deepEqual(calls[1].args.slice(1), [burnRippling.options, burnRippling._chars]);
+    assert.deepEqual(calls[2].args.slice(1), [burnRippling.options, burnRippling._chars]);
+    assert.equal(calls[0].args[0].revealMode, 'burn');
+
+    calls.length = 0;
+    const plainElement = host('B');
+    plainRippling = new TextRippling(plainElement, {
+      effect: 'none',
+      revealMode: 'none',
+      remeasureOn: 'manual',
+    });
+    assert.deepEqual(calls.map((call) => call.label), [
+      'reveal.initChar', 'burn.initChar', 'redact.initChar', 'reveal.attach',
+    ]);
+
+    const engine = plainRippling._engine;
+    const originalChars = plainRippling._chars;
+    plainRippling.destroy();
+    assert.deepEqual(plainRippling._chars, []);
     assert.deepEqual(engine._chars, []);
     assert.notEqual(engine._chars, originalChars);
     assert.equal(engine._element, null);
-    assert.doesNotThrow(() => rippling._tick(20, 0));
+    assert.doesNotThrow(() => plainRippling._tick(20, 0));
   } finally {
-    for (let i = 0; i < modules.length; i++) modules[i][1].onUpdate = originals[i];
-    if (!rippling._destroyed) rippling.destroy();
+    for (const [module, hook, original] of originals) module[hook] = original;
+    if (burnRippling && !burnRippling._destroyed) burnRippling.destroy();
+    if (plainRippling && !plainRippling._destroyed) plainRippling.destroy();
   }
 });

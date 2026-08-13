@@ -1269,6 +1269,33 @@
     },
   };
 
+  // Fixed lifecycle sequencing for the feature modules that share Char state.
+  // Keep method lookup on the public module objects dynamic: consumers may
+  // replace those methods through the established TextRippling attachments.
+  const FeatureLifecycle = {
+    initChar(c) {
+      RevealLayer.initChar(c);
+      BurnReveal.initChar(c);
+      Redact.initChar(c);
+    },
+
+    attach(chars, options, element) {
+      RevealLayer.attach(chars, options, element);
+      if (options.revealMode === 'burn') BurnReveal.attach(chars, options);
+    },
+
+    update(prev, curr, chars, element) {
+      // Different reveal writers assign different meanings to these latches.
+      if (prev.revealMode !== curr.revealMode) {
+        for (const c of chars) { c.colorPinned = false; c.wasLit = false; }
+      }
+
+      RevealLayer.onUpdate(prev, curr, chars, element);
+      BurnReveal.onUpdate(prev, curr, chars);
+      Redact.onUpdate(prev, curr, chars);
+    },
+  };
+
   // ════════════════════════════════════════════════════════════════════
   //  Splitter — text → Char[].
   //
@@ -1410,11 +1437,9 @@
         _rippleStash: null,
         _rippleStashFrame: -1,
       };
-      // Per-module field hand-off — see each module's initChar comment
-      // for the field set it owns.
-      RevealLayer.initChar(c);
-      BurnReveal.initChar(c);
-      Redact.initChar(c);
+      // Per-module field hand-off. The lifecycle owns the fixed order;
+      // each feature's public initChar hook still owns its own fields.
+      FeatureLifecycle.initChar(c);
       return c;
     },
 
@@ -1656,8 +1681,7 @@
       this._frameId = 0;
 
       this._captureBaseColor();
-      RevealLayer.attach(chars, options, element);
-      if (options.revealMode === 'burn') BurnReveal.attach(chars, options);
+      FeatureLifecycle.attach(chars, options, element);
     }
 
     update(options, patch) {
@@ -1669,16 +1693,7 @@
       this._revealCache = null;
       this._emberCache = null;
 
-      // Different reveal writers assign different meanings to these latches.
-      if (prev.revealMode !== options.revealMode) {
-        for (const c of this._chars) { c.colorPinned = false; c.wasLit = false; }
-      }
-
-      // Keep the explicit feature lifecycle order visible at the integration
-      // point. There is deliberately no generic lifecycle coordinator here.
-      RevealLayer.onUpdate(prev, options, this._chars, this._element);
-      BurnReveal.onUpdate(prev, options, this._chars);
-      Redact.onUpdate(prev, options, this._chars);
+      FeatureLifecycle.update(prev, options, this._chars, this._element);
     }
 
     tick(now, dt, options) {

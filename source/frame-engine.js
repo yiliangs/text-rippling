@@ -1,6 +1,7 @@
 import { CursorField } from './browser-runtime.js';
 import { Color } from './color.js';
 import { REF_DT_MS, REST } from './constants.js';
+import { FeatureLifecycle } from './feature-lifecycle.js';
 import { BurnReveal } from './features/burn-reveal.js';
 import { Redact } from './features/redact.js';
 import { BloomRipple, RevealLayer, WaveReveal } from './features/reveal.js';
@@ -23,8 +24,7 @@ class FrameEngine {
     this._frameId = 0;
 
     this._captureBaseColor();
-    RevealLayer.attach(chars, options, element);
-    if (options.revealMode === 'burn') BurnReveal.attach(chars, options);
+    FeatureLifecycle.attach(chars, options, element);
   }
 
   update(options, patch) {
@@ -36,16 +36,7 @@ class FrameEngine {
     this._revealCache = null;
     this._emberCache = null;
 
-    // Different reveal writers assign different meanings to these latches.
-    if (prev.revealMode !== options.revealMode) {
-      for (const c of this._chars) { c.colorPinned = false; c.wasLit = false; }
-    }
-
-    // Keep the explicit feature lifecycle order visible at the integration
-    // point. There is deliberately no generic lifecycle coordinator here.
-    RevealLayer.onUpdate(prev, options, this._chars, this._element);
-    BurnReveal.onUpdate(prev, options, this._chars);
-    Redact.onUpdate(prev, options, this._chars);
+    FeatureLifecycle.update(prev, options, this._chars, this._element);
   }
 
   tick(now, dt, options) {
