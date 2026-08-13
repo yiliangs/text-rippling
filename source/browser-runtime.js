@@ -1,3 +1,15 @@
+// Pointer events and DOMRects are viewport-relative. Physics runs in page
+// space so stamps stay attached to the document while the viewport scrolls.
+// Keep the browser fallback policy here so every producer crosses the same
+// coordinate boundary.
+function clientToPageX(clientX) {
+  return clientX + (window.scrollX || window.pageXOffset || 0);
+}
+
+function clientToPageY(clientY) {
+  return clientY + (window.scrollY || window.pageYOffset || 0);
+}
+
 // ════════════════════════════════════════════════════════════════════
 //  CursorField — global pointer state + wave-stamp ring buffer.
 //
@@ -43,8 +55,8 @@ const CursorField = (() => {
     const dy = y - lastStampY;
     if (dx * dx + dy * dy < STAMP_MIN_DIST_SQ) return;
     state.stamps.push({
-      x: x + (window.scrollX || window.pageXOffset || 0),
-      y: y + (window.scrollY || window.pageYOffset || 0),
+      x: clientToPageX(x),
+      y: clientToPageY(y),
       t0: t,
     });
     lastStampX = x;
@@ -151,4 +163,4 @@ const AnimationLoop = (() => {
 })();
 
 
-export { AnimationLoop, CursorField };
+export { AnimationLoop, CursorField, clientToPageX, clientToPageY };

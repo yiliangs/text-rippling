@@ -1,4 +1,4 @@
-import { CursorField } from './browser-runtime.js';
+import { CursorField, clientToPageX, clientToPageY } from './browser-runtime.js';
 import { Color } from './color.js';
 import { REF_DT_MS, REST } from './constants.js';
 import { FeatureLifecycle } from './feature-lifecycle.js';
@@ -154,11 +154,9 @@ class FrameEngine {
 }
 
 function makeContext(now, dt) {
-  const sx = window.scrollX || window.pageXOffset || 0;
-  const sy = window.scrollY || window.pageYOffset || 0;
   return {
-    mouseX:  CursorField.state.x + sx,
-    mouseY:  CursorField.state.y + sy,
+    mouseX:  clientToPageX(CursorField.state.x),
+    mouseY:  clientToPageY(CursorField.state.y),
     mouseVx: CursorField.state.vx,
     mouseVy: CursorField.state.vy,
     time:    now,

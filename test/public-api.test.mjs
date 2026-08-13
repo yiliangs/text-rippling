@@ -146,6 +146,8 @@ test('CommonJS and ESM expose their exact public shapes', () => {
   assert.equal(Object.hasOwn(PUBLIC_API, 'RippleSampler'), false);
   assert.equal(Object.hasOwn(PUBLIC_API, 'rippleSampler'), false);
   assert.equal(commonJs.cursor, commonJs.TextRippling.cursor);
+  assert.deepEqual(Object.keys(commonJs.cursor), ['attach', 'update', 'state']);
+  assert.deepEqual(Object.keys(commonJs.cursor.state), ['x', 'y', 'vx', 'vy', 'stamps']);
 
   for (const key of ESM_KEYS) {
     if (key !== 'default' && key !== 'TextRippling') {

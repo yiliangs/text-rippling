@@ -180,13 +180,18 @@ class FakeResizeObserver {
 
 const document = new FakeDocument();
 const animationFrames = new Map();
+const windowListeners = new Map();
 const window = {
   document,
   pageXOffset: 0,
   pageYOffset: 0,
   scrollX: 0,
   scrollY: 0,
-  addEventListener() {},
+  addEventListener(type, listener) {
+    const listeners = windowListeners.get(type) || [];
+    listeners.push(listener);
+    windowListeners.set(type, listeners);
+  },
 };
 let nextAnimationFrame = 1;
 
@@ -211,8 +216,16 @@ function host(html, text) {
   return element;
 }
 
+function dispatchWindowEvent(type, event) {
+  for (const listener of windowListeners.get(type) || []) listener(event);
+}
+
 function resetFixture() {
   document.reset();
+  window.pageXOffset = 0;
+  window.pageYOffset = 0;
+  window.scrollX = 0;
+  window.scrollY = 0;
   TextRippling.cursor.state.x = -1e6;
   TextRippling.cursor.state.y = -1e6;
   TextRippling.cursor.state.vx = 0;
@@ -342,6 +355,112 @@ test('rippleAll preserves query order and returns one instance per match', () =>
     assert.ok(instances.every((instance) => instance instanceof TextRippling));
   } finally {
     instances.forEach((instance) => instance.destroy());
+  }
+});
+
+test('measurement and frame context share the client-to-page fallback policy', () => {
+  const frames = [];
+  const effect = (dx, dy, dist, _falloff, _options, ctx) => {
+    frames.push({ dx, dy, dist, mouseX: ctx.mouseX, mouseY: ctx.mouseY });
+    return {};
+  };
+  effect.global = true;
+
+  window.scrollX = 0;
+  window.pageXOffset = 120;
+  window.scrollY = 45;
+  window.pageYOffset = 90;
+
+  const rippling = new TextRippling(host('A'), {
+    effect,
+    revealMode: 'none',
+    remeasureOn: 'manual',
+  });
+
+  try {
+    TextRippling.cursor.state.x = 5;
+    TextRippling.cursor.state.y = 10;
+    rippling._tick(10, 0);
+
+    assert.deepEqual([rippling._chars[0].hx, rippling._chars[0].hy], [125, 55]);
+    assert.deepEqual(frames[0], {
+      dx: 0,
+      dy: 0,
+      dist: 0,
+      mouseX: 125,
+      mouseY: 55,
+    });
+
+    window.scrollX = 35;
+    window.pageXOffset = 120;
+    window.scrollY = 0;
+    window.pageYOffset = 80;
+    rippling.remeasure();
+    rippling._tick(20, 0);
+
+    assert.deepEqual([rippling._chars[0].hx, rippling._chars[0].hy], [40, 90]);
+    assert.deepEqual(frames[1], {
+      dx: 0,
+      dy: 0,
+      dist: 0,
+      mouseX: 40,
+      mouseY: 90,
+    });
+  } finally {
+    rippling.destroy();
+  }
+});
+
+test('pointer stamps anchor at event-time scroll and filter movement in client space', () => {
+  const frames = [];
+  const effect = (_dx, _dy, _dist, _falloff, _options, ctx) => {
+    frames.push({ mouseX: ctx.mouseX, mouseY: ctx.mouseY, stamps: ctx.stamps });
+    return {};
+  };
+  effect.global = true;
+
+  window.scrollX = 0;
+  window.pageXOffset = 100;
+  window.scrollY = 0;
+  window.pageYOffset = 200;
+
+  const rippling = new TextRippling(host('A'), {
+    effect,
+    revealMode: 'none',
+    remeasureOn: 'manual',
+  });
+
+  try {
+    const cursor = TextRippling.cursor;
+    const stamps = cursor.state.stamps;
+
+    dispatchWindowEvent('mousemove', { clientX: 10, clientY: 20, timeStamp: 10 });
+    assert.equal(cursor.state.stamps, stamps);
+    assert.deepEqual([cursor.state.x, cursor.state.y], [10, 20]);
+    assert.deepEqual(stamps, [{ x: 110, y: 220, t0: 10 }]);
+    const firstStamp = stamps[0];
+
+    window.scrollX = 1000;
+    window.scrollY = 2000;
+    dispatchWindowEvent('mousemove', { clientX: 13, clientY: 23, timeStamp: 20 });
+
+    assert.deepEqual([cursor.state.x, cursor.state.y], [13, 23]);
+    assert.equal(stamps.length, 1);
+    assert.equal(stamps[0], firstStamp);
+    rippling._tick(20, 0);
+    assert.deepEqual(
+      [frames[0].mouseX, frames[0].mouseY],
+      [1013, 2023],
+    );
+    assert.equal(frames[0].stamps, stamps);
+    assert.deepEqual(stamps[0], { x: 110, y: 220, t0: 10 });
+
+    dispatchWindowEvent('mousemove', { clientX: 16, clientY: 20, timeStamp: 30 });
+    assert.equal(cursor.state.stamps, stamps);
+    assert.equal(stamps[0], firstStamp);
+    assert.deepEqual(stamps[1], { x: 1016, y: 2020, t0: 30 });
+  } finally {
+    rippling.destroy();
   }
 });
 

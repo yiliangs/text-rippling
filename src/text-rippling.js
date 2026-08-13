@@ -894,6 +894,18 @@
     },
   };
 
+  // Pointer events and DOMRects are viewport-relative. Physics runs in page
+  // space so stamps stay attached to the document while the viewport scrolls.
+  // Keep the browser fallback policy here so every producer crosses the same
+  // coordinate boundary.
+  function clientToPageX(clientX) {
+    return clientX + (window.scrollX || window.pageXOffset || 0);
+  }
+
+  function clientToPageY(clientY) {
+    return clientY + (window.scrollY || window.pageYOffset || 0);
+  }
+
   // ════════════════════════════════════════════════════════════════════
   //  CursorField — global pointer state + wave-stamp ring buffer.
   //
@@ -939,8 +951,8 @@
       const dy = y - lastStampY;
       if (dx * dx + dy * dy < STAMP_MIN_DIST_SQ) return;
       state.stamps.push({
-        x: x + (window.scrollX || window.pageXOffset || 0),
-        y: y + (window.scrollY || window.pageYOffset || 0),
+        x: clientToPageX(x),
+        y: clientToPageY(y),
         t0: t,
       });
       lastStampX = x;
@@ -1826,11 +1838,9 @@
   }
 
   function makeContext(now, dt) {
-    const sx = window.scrollX || window.pageXOffset || 0;
-    const sy = window.scrollY || window.pageYOffset || 0;
     return {
-      mouseX:  CursorField.state.x + sx,
-      mouseY:  CursorField.state.y + sy,
+      mouseX:  clientToPageX(CursorField.state.x),
+      mouseY:  clientToPageY(CursorField.state.y),
       mouseVx: CursorField.state.vx,
       mouseVy: CursorField.state.vy,
       time:    now,
@@ -1976,8 +1986,8 @@
 
     // Char centers live in page space, matching cursor stamps and frame context.
     _measure() {
-      const sx = window.scrollX || window.pageXOffset || 0;
-      const sy = window.scrollY || window.pageYOffset || 0;
+      const sx = clientToPageX(0);
+      const sy = clientToPageY(0);
       for (const c of this._chars) {
         const prev = c.el.style.transform;
         c.el.style.transform = '';

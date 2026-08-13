@@ -1,4 +1,9 @@
-import { AnimationLoop, CursorField } from './browser-runtime.js';
+import {
+  AnimationLoop,
+  CursorField,
+  clientToPageX,
+  clientToPageY,
+} from './browser-runtime.js';
 import { DEFAULTS } from './defaults.js';
 import { FrameEngine } from './frame-engine.js';
 import { Splitter } from './glyph-runtime.js';
@@ -52,8 +57,8 @@ class TextRippling {
 
   // Char centers live in page space, matching cursor stamps and frame context.
   _measure() {
-    const sx = window.scrollX || window.pageXOffset || 0;
-    const sy = window.scrollY || window.pageYOffset || 0;
+    const sx = clientToPageX(0);
+    const sy = clientToPageY(0);
     for (const c of this._chars) {
       const prev = c.el.style.transform;
       c.el.style.transform = '';
