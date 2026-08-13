@@ -4,577 +4,28 @@
 // Drop in via <script src="text-rippling.js"></script> and use the global
 // `TextRippling` constructor. Also exposes CommonJS exports for Node /
 // bundlers; an ESM wrapper lives at `text-rippling.mjs`.
-//
-// ── Internal architecture ────────────────────────────────────────────────
-//
-//   ┌──────────── Public API ────────────┐
-//   │ new TextRippling(element, options) │
-//   └─────────────────┬──────────────────┘
-//                     │
-//   ┌─────────────────▼──────────────────────────────────────────────┐
-//   │  TextRippling (façade)                                          │
-//   │   constructor → Splitter.split → measure → bind → register      │
-//   │   _tick(now) →  for each Char:                                  │
-//   │                   target = Effect(char, ctx)                    │
-//   │                   Char.integrate(target)   // spring + lerp     │
-//   │                   Renderer.write(char)     // transform/color/glyph│
-//   └─────────────────┬──────────────────────────────────────────────┘
-//                     │
-//   ┌─────────────────▼──────────────────────────────────────────────┐
-//   │  Subsystems (singletons / pure)                                 │
-//   │   CursorField   — pointer position, velocity, stamp ring buffer │
-//   │   AnimationLoop — single shared rAF, drives all instances        │
-//   │   Splitter      — text → Char[]                                 │
-//   │   Renderer      — pure DOM-write functions (idle-skipping)       │
-//   │   Effects       — registry of (ctx → target) functions           │
-//   │   Falloffs      — registry of (dist, radius → weight) functions  │
-//   │   GlyphPickers  — registry of (originalChar, opts → string)      │
-//   │   Ripple        — self-contained ring-wave physics; the          │
-//   │                   `ripple` Effects entry is a thin adapter onto it│
-//   │   RevealLayer   — sticky two-layer text overlay; cursor-proximity │
-//   │                   driven, latches once and stays                  │
-//   │   WaveReveal    — reversible two-layer overlay; wave-amplitude    │
-//   │                   driven, dithered per-char threshold (Ripple)    │
-//   │   BurnReveal    — paper-burn reveal of the element's own text     │
-//   │                   from under a twinkling procedural mask; per-    │
-//   │                   char heat field + creeping smolder front        │
-//   │   Color         — parse / lerp utilities                        │
-//   └─────────────────────────────────────────────────────────────────┘
-
-(function (root) {
+// Generated from the authored modules in source/.
+(function () {
   'use strict';
 
   const VERSION = '0.1.0';
 
-  // Reference frame interval (≈60Hz) — the rate the per-step integrator
+  // Reference frame interval (≈60Hz), the rate the per-step integrator
   // constants in DEFAULTS are tuned for. The dt-aware integrators rescale
   // to this so visible behavior is identical across refresh rates.
   const REF_DT_MS = 16.67;
 
-  // ════════════════════════════════════════════════════════════════════
-  //  Color — parse "#rgb" / "#rrggbb" / "rgb(...)" / "rgba(...)" → [r,g,b]
-  // ════════════════════════════════════════════════════════════════════
-
-  const Color = {
-    parse(str) {
-      if (!str) return [255, 255, 255];
-      if (str.charAt(0) === '#') {
-        let hex = str.slice(1);
-        if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
-        if (hex.length === 6) {
-          const n = parseInt(hex, 16);
-          if (!isNaN(n)) return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-        }
-      }
-      const m = str.match(/(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)/);
-      if (m) return [+m[1] | 0, +m[2] | 0, +m[3] | 0];
-      return [255, 255, 255];
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
-  //  Falloffs — distance-to-radius weighting curves, range [0..1].
-  //  Effects use these to scale their output by cursor proximity.
-  // ════════════════════════════════════════════════════════════════════
-
-  const Falloffs = {
-    gaussian: (d, r) => Math.exp(-((d / r) * (d / r)) * 2.5),
-    linear:   (d, r) => Math.max(0, 1 - d / r),
-    inverse:  (d, r) => 1 / (1 + (d / r) * (d / r) * 4),
-    smooth:   (d, r) => {
-      const t = Math.max(0, 1 - d / r);
-      return t * t * (3 - 2 * t);
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
-  //  Ripple — self-contained ring-physics water-wave subsystem.
-  //
-  //  Stateless and dependency-free: knows nothing about CursorField,
-  //  Char, ctx, REST, or the rest of the framework. Given a char
-  //  position, the current time, a stamp history, and four tuning
-  //  constants, returns the wave-amplitude state at that char.
-  //  `Effects.ripple` is the thin adapter that bolts this onto the
-  //  Effects registry.
-  //
-  //  Input contract:
-  //    charX, charY  — char center, ANY coord space, but must match the
-  //                    coord space stamps were recorded in
-  //    time          — current time (DOMHighResTimeStamp ms)
-  //    stamps        — array of { x, y, t0 } disturbance origins, where
-  //                    (x, y) shares the char coord space and t0 shares
-  //                    `time`'s base. Read-only; never mutated.
-  //    speed         — px/ms; wavefront expansion rate
-  //    spatial       — px; wave amplitude is 1/e at this distance
-  //    postHit       — ms; exponential decay after wavefront passes
-  //    edge          — px; width of the swap band at the wavefront
-  //
-  //  Returns:
-  //    { brightness, scramble, interior } — brightness/scramble in [0, 1];
-  //                                          interior is a boolean
-  //    null                                — char has no active wake
-  //                                          (caller treats as rest)
-  //
-  //  Frontier semantics: the moment ANY stamp's wavefront has fully
-  //  passed a char (edgeDist > edge AND timeFromHit > 0), `scramble` is
-  //  forced to 0 and `interior` is true — only the leading ring of the
-  //  wake scrambles glyphs; the bulk shows lit-but-original characters.
-  //  `interior` is exposed for downstream modules (e.g. RevealLayer) that
-  //  need the same "wave has passed" signal without re-deriving it.
-  // ════════════════════════════════════════════════════════════════════
-
-  const Ripple = {
-    // Tuning defaults — the framework's DEFAULTS mirrors these under
-    // `ripple*` keys so the physical constants are owned in one place.
-    DEFAULTS: {
-      speed:   0.55,
-      spatial: 180,
-      postHit: 380,
-      edge:    22,
-    },
-
-    compute(charX, charY, time, stamps, speed, spatial, postHit, edge) {
-      if (!stamps || stamps.length === 0) return null;
-
-      let brightness = 0;
-      let frontierAmp = 0;
-      let interior = false;
-
-      for (let i = 0; i < stamps.length; i++) {
-        const s = stamps[i];
-        const ddx = charX - s.x;
-        const ddy = charY - s.y;
-        const dd = Math.sqrt(ddx * ddx + ddy * ddy);
-
-        const amplAtHit = Math.exp(-dd / spatial);
-        if (amplAtHit < 0.02) continue;
-
-        const timeFromHit = time - (s.t0 + dd / speed);
-
-        if (timeFromHit >= 0) {
-          const contrib = amplAtHit * Math.exp(-timeFromHit / postHit);
-          if (contrib > brightness) brightness = contrib;
-        }
-
-        const edgeDist = Math.abs(timeFromHit) * speed;
-        if (edgeDist < edge) {
-          const es = (1 - edgeDist / edge) * amplAtHit;
-          if (es > frontierAmp) frontierAmp = es;
-        } else if (timeFromHit > 0) {
-          // This stamp's wavefront has fully passed — char is in the wake bulk.
-          interior = true;
-        }
-      }
-
-      const scramble = interior ? 0 : frontierAmp;
-      return { brightness, scramble, interior };
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
-  //  WordReveal — shared word-level reveal orchestration.
-  //
-  //  Both RevealLayer (cursor mode, sticky) and WaveReveal (wave mode,
-  //  reversible) sit on top of this module. The activation/deactivation
-  //  unit is the WORD; per-char `c.revealed` is derived from the word's
-  //  state plus this char's distance from the word's anchor letter.
-  //
-  //  Why: a per-char activation model with a separate cascade
-  //  choreography leaks orphan-letter artifacts when the cursor doubles
-  //  back — a returning wave can re-activate scattered letters mid-
-  //  collapse while others continue un-revealing per their stale
-  //  schedule. Word-level state with derived per-char render guarantees
-  //  any active phase keeps already-revealed chars revealed (only
-  //  flips false → true), and any collapse phase only flips true →
-  //  false. Re-activation simply latches: existing revealed chars stay
-  //  revealed; chars that had un-revealed re-bloom from the new anchor.
-  //
-  //  Per-word state object (created by Splitter, shared by all sibling
-  //  chars via `c.wordState`):
-  //
-  //    chars              — Char[] members of the word
-  //    active             — boolean: in ACTIVE phase
-  //    activatedAt        — timestamp the current ACTIVE phase began
-  //    anchorIdx          — index in chars[] of the activator letter
-  //    collapseAt         — 0 or timestamp the COLLAPSING phase began
-  //    lastTouchedAt      — most recent frame any char was touched
-  //    maxDistFromAnchor  — max |i - anchorIdx| across word, set on activation
-  //    _touchedThisFrame  — per-frame scratch: any char touched this frame?
-  //    _anchorCandidate*  — per-frame scratch: closest-to-cursor candidate
-  //
-  //  Animation rules (per char per frame, applied by applyChar):
-  //
-  //    active   →  c.revealed = c.revealed || (now >= activatedAt + dist*stepMs)
-  //    collapse →  c.revealed = c.revealed && (now <  collapseAt + (maxDist - dist)*stepMs)
-  //    idle     →  c.revealed = false
-  //
-  //  Active phase only flips chars false→true; collapse only true→false.
-  //  This is the key invariant that keeps back-and-forth tracks clean.
-  //
-  //  Anchor selection: on word activation, the cursor-closest touched
-  //  char becomes the anchor. Anchor is locked while word is active —
-  //  subsequent touches refresh `lastTouchedAt` but don't move the
-  //  anchor. A re-activation after collapse picks a fresh anchor.
-  // ════════════════════════════════════════════════════════════════════
-
-  const WordReveal = {
-    // Construct a fresh per-word state record. Splitter calls this once
-    // per word, then attaches the resulting object to every member char
-    // via `c.wordState` (shared reference).
-    makeWord(chars) {
-      return {
-        chars,
-        active: false,
-        activatedAt: 0,
-        anchorIdx: 0,
-        collapseAt: 0,
-        lastTouchedAt: 0,
-        maxDistFromAnchor: 0,
-        // Per-frame scratch — reset by resetScratch() at frame start.
-        _touchedThisFrame: false,
-        _anchorCandidateIdx: -1,
-        _anchorCandidateDistSq: Infinity,
-      };
-    },
-
-    // Reset per-frame scratch fields. Caller should invoke once per word
-    // per frame, before any touch() calls for that frame.
-    resetScratch(w) {
-      w._touchedThisFrame = false;
-      w._anchorCandidateIdx = -1;
-      w._anchorCandidateDistSq = Infinity;
-    },
-
-    // Mark a char as touched this frame; track closest-to-cursor as the
-    // anchor candidate (used only if the word activates this frame —
-    // already-active words keep their existing anchor).
-    touch(c, distSqToCursor) {
-      const w = c.wordState;
-      if (!w) return;
-      w._touchedThisFrame = true;
-      if (distSqToCursor < w._anchorCandidateDistSq) {
-        w._anchorCandidateDistSq = distSqToCursor;
-        w._anchorCandidateIdx = c.indexInWord;
-      }
-    },
-
-    // Per-word state transition. Caller invokes once per word per frame
-    // after all touch() calls. `sticky=true` skips the active→collapse
-    // transition (RevealLayer's lottery-ticket model).
-    tickWord(w, now, holdMs, sticky) {
-      if (w._touchedThisFrame) {
-        w.lastTouchedAt = now;
-        if (!w.active) {
-          w.active = true;
-          w.activatedAt = now;
-          w.anchorIdx = w._anchorCandidateIdx;
-          w.collapseAt = 0;
-          const a = w.anchorIdx;
-          const n = w.chars.length;
-          w.maxDistFromAnchor = a > n - 1 - a ? a : n - 1 - a;
-        }
-      } else if (!sticky && w.active && w.lastTouchedAt + holdMs <= now) {
-        w.active = false;
-        w.collapseAt = now;
-      }
-    },
-
-    // Per-char render. Latches c.revealed via the active/collapse rules
-    // documented in the banner above. Caller invokes once per char per
-    // frame after tickWord has settled the per-word state.
-    applyChar(c, now, stepMs) {
-      const w = c.wordState;
-      if (!w) { c.revealed = false; return; }
-      const di = c.indexInWord - w.anchorIdx;
-      const dist = di < 0 ? -di : di;
-      if (w.active) {
-        if (!c.revealed && now >= w.activatedAt + dist * stepMs) c.revealed = true;
-      } else if (w.collapseAt > 0) {
-        const remain = w.collapseAt + (w.maxDistFromAnchor - dist) * stepMs;
-        if (c.revealed && now >= remain) c.revealed = false;
-      } else {
-        c.revealed = false;
-      }
-    },
-
-    // Reset a word's persistent state to IDLE. Called by RevealLayer.attach
-    // when the reveal text changes (a fresh start should clear any
-    // active/collapsing animation in progress).
-    resetWord(w) {
-      w.active = false;
-      w.activatedAt = 0;
-      w.anchorIdx = 0;
-      w.collapseAt = 0;
-      w.lastTouchedAt = 0;
-      w.maxDistFromAnchor = 0;
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
-  //  RevealLayer — optional two-layer text overlay (cursor mode).
-  //
-  //  Pairs each visible char with a counterpart from a "lower" string,
-  //  supplied via `options.revealText` or a `data-reveal` attribute on
-  //  the host element. Activation is purely cursor-proximity driven —
-  //  no wave physics, no diffusion, no shared state with any effect.
-  //
-  //  Trigger: when ANY char in a word is within `revealRadius` of the
-  //  cursor, the word activates with the cursor-closest touched char as
-  //  the anchor. The whole word then blooms outward letter-by-letter
-  //  per `revealWordStepMs`. Sticky — once activated, words never
-  //  collapse for the lifetime of the instance (lottery-ticket model).
-  //
-  //  Color is pinned discretely via Renderer.colorAndGlow when
-  //  `c.revealed` is true; no brightness modulation, no two-state ramp.
-  //
-  //  No setup → no behavior. With nothing in `revealText` and no
-  //  `data-reveal` attribute, `frame` does nothing and the module is
-  //  effectively absent.
-  // ════════════════════════════════════════════════════════════════════
-
-  const RevealLayer = {
-    // Per-char field ownership. The per-word state lives on `c.wordState`
-    // (intrinsic, populated by Splitter); this module owns only the
-    // chars' lower-layer glyph + pinned-color latch.
-    //
-    //   revealChar   — null | string : lower-layer glyph (set by attach)
-    //   revealed     — boolean       : derived per frame by WordReveal
-    //   colorPinned  — boolean       : renderer-side latch paired with revealed
-    initChar(c) {
-      c.revealChar = null;
-      c.revealed = false;
-      c.colorPinned = false;
-    },
-
-    // Lifecycle hook: react to options changes from TextRippling.update().
-    // Owned cleanup logic lives here, not in update(), so adding a new
-    // reveal-related option doesn't require editing the façade.
-    onUpdate(prev, curr, chars, element) {
-      if (curr.revealText !== prev.revealText) {
-        RevealLayer.attach(chars, curr, element);
-      }
-    },
-
-    // Walk chars[] and fill `revealChar` per visible position. Sources
-    // (in priority order):
-    //   1. `opts.revealText` (string)
-    //   2. `element.dataset.reveal` (HTML `data-reveal="..."` fallback)
-    //   3. neither — feature is off; all `revealChar` set to null
-    // Length policy: short reveal pads with null (no swap on the tail —
-    // upper still shows there); long reveal is truncated to chars.length.
-    // Spaces in the reveal string are stripped so the mapping aligns
-    // with Splitter's visible-char-only chars[] (Splitter doesn't emit
-    // spans for whitespace either). Also resets every word's state to
-    // IDLE so a fresh reveal text starts cleanly.
-    attach(chars, opts, element) {
-      let raw = opts.revealText;
-      if (!raw && element && element.dataset && element.dataset.reveal) {
-        raw = element.dataset.reveal;
-      }
-      const lower = [];
-      if (raw) {
-        for (const ch of Array.from(raw)) {
-          if (!/\s/.test(ch)) lower.push(ch);
-        }
-      }
-      const seenWords = new Set();
-      for (let i = 0; i < chars.length; i++) {
-        chars[i].revealChar = raw && i < lower.length ? lower[i] : null;
-        chars[i].revealed = false;
-        const w = chars[i].wordState;
-        if (w && !seenWords.has(w)) { seenWords.add(w); WordReveal.resetWord(w); }
-      }
-    },
-
-    // Per-frame orchestrator (cursor mode, sticky). Runs three passes:
-    //   1. touch detection — any char within `revealRadius` of cursor
-    //      marks its word as touched, with the cursor-closest char
-    //      becoming the anchor candidate.
-    //   2. word state transition (sticky → never collapses; tickWord
-    //      with sticky=true only handles the IDLE→ACTIVE direction).
-    //   3. per-char render — c.revealed latched via WordReveal.applyChar.
-    //
-    // Module-private scratch Set tracks per-frame "words seen", used to
-    // dedupe and to limit tickWord calls to words actually present.
-    frame(chars, ctx, opts) {
-      const stepMs = opts.revealWordStepMs;
-      const innerR = opts.revealRadius;
-      const innerRSq = innerR * innerR;
-      _wordScratch.clear();
-
-      for (let i = 0; i < chars.length; i++) {
-        const c = chars[i];
-        if (c.revealChar == null) { c.revealed = false; continue; }
-        const w = c.wordState;
-        if (!w) continue;
-        if (!_wordScratch.has(w)) { WordReveal.resetScratch(w); _wordScratch.add(w); }
-        const dx = c.hx - ctx.mouseX;
-        const dy = c.hy - ctx.mouseY;
-        const distSq = dx * dx + dy * dy;
-        if (distSq < innerRSq) WordReveal.touch(c, distSq);
-      }
-
-      for (const w of _wordScratch) WordReveal.tickWord(w, ctx.time, Infinity, true);
-
-      for (let i = 0; i < chars.length; i++) {
-        const c = chars[i];
-        if (c.revealChar == null) continue;
-        WordReveal.applyChar(c, ctx.time, stepMs);
-      }
-    },
-  };
-
-  // Module-private scratch Set, reused frame-to-frame to avoid per-frame
-  // allocation. RevealLayer.frame and wordWaveFrame (the shared core
-  // behind WaveReveal and BloomRipple) both borrow it during their own
-  // pass — they don't run concurrently (revealMode dispatch is
-  // single-mode per instance per frame).
-  const _wordScratch = new Set();
-
-  // ════════════════════════════════════════════════════════════════════
-  //  wordWaveFrame — shared three-pass orchestrator behind both
-  //  WaveReveal (sticky=false) and BloomRipple (sticky=true).
-  //
-  //  Same shape as RevealLayer.frame: touch → tickWord → applyChar. The
-  //  touch predicate is cursor proximity OR wave amplitude > c.seed
-  //  (per the WaveReveal banner below). The two modules differ only in
-  //  the (sticky, holdMs) pair handed to WordReveal.tickWord — sticky
-  //  freezes the active→collapse transition, holdMs sets the idle
-  //  window for the non-sticky path.
-  // ════════════════════════════════════════════════════════════════════
-
-  function wordWaveFrame(chars, ctx, opts, sticky, holdMs) {
-    const stepMs = opts.revealWordStepMs;
-    const innerR = opts.revealRadius;
-    const innerRSq = innerR * innerR;
-    _wordScratch.clear();
-
-    for (let i = 0; i < chars.length; i++) {
-      const c = chars[i];
-      if (c.revealChar == null) { c.revealed = false; continue; }
-      const w = c.wordState;
-      if (!w) continue;
-      if (!_wordScratch.has(w)) { WordReveal.resetScratch(w); _wordScratch.add(w); }
-
-      const dx = c.hx - ctx.mouseX;
-      const dy = c.hy - ctx.mouseY;
-      const distSq = dx * dx + dy * dy;
-
-      let touched = distSq < innerRSq;
-      if (!touched) {
-        // Stash the result so Effects.ripple (when paired with this
-        // mode, e.g. bloom-ripple's effect: 'ripple') can reuse it
-        // instead of paying the per-stamp loop a second time. Note:
-        // when the char is inside cursor proximity (touched=true here)
-        // we skip the call entirely — Effects.ripple will recompute
-        // for that handful of chars, which is negligible vs the bulk.
-        const r = Ripple.compute(
-          c.hx, c.hy, ctx.time, ctx.stamps,
-          opts.rippleSpeed, opts.rippleSpatialAtten,
-          opts.ripplePostHit, opts.rippleEdge,
-        );
-        c._rippleStash = r;
-        c._rippleStashFrame = ctx.frameId;
-        if (r && r.brightness > c.seed) touched = true;
-      }
-      if (touched) WordReveal.touch(c, distSq);
-    }
-
-    for (const w of _wordScratch) WordReveal.tickWord(w, ctx.time, holdMs, sticky);
-
-    for (let i = 0; i < chars.length; i++) {
-      const c = chars[i];
-      if (c.revealChar == null) continue;
-      WordReveal.applyChar(c, ctx.time, stepMs);
-    }
-  }
-
-  // ════════════════════════════════════════════════════════════════════
-  //  WaveReveal — reversible wave-driven dithered two-layer overlay
-  //               with word-level activation.
-  //
-  //  Sibling to RevealLayer. Same two-layer setup (revealChar per Char,
-  //  revealColor as the pinned destination) and the same renderer hookup
-  //  (Renderer.colorAndGlow's c.revealed branch handles both pin AND
-  //  unpin transitions). DIFFERENCES from RevealLayer:
-  //
-  //    RevealLayer  → cursor proximity, sticky (no collapse).
-  //    WaveReveal   → cursor proximity OR wave amplitude > c.seed,
-  //                   reversible — word collapses back after holdMs of
-  //                   no touch.
-  //
-  //  Both use the shared WordReveal module: per-word activation/collapse
-  //  state plus per-char animation derived from word state + distance
-  //  from the word's anchor letter. See the WordReveal banner above.
-  //
-  //  Touch criteria (per char per frame):
-  //    1. distance to cursor < `revealRadius`  →  touched (always-flip
-  //       core; ensures sub-frame amplitude peaks under the cursor
-  //       can never be missed even if the per-char seed is high).
-  //    2. wave amplitude (Ripple.compute) > c.seed → touched (the
-  //       per-char seed gives the dither — a wave at half amplitude
-  //       touches roughly half the chars in its reach).
-  //
-  //  Any touched char in a word marks the word as touched-this-frame.
-  //  The cursor-closest touched char becomes the activation anchor.
-  //  Word stays active while any of its chars is touched any frame
-  //  within `revealHoldMs`; after that idle window the word collapses,
-  //  letters un-revealing furthest-from-anchor first.
-  //
-  //  Why word-level: a per-char activation model with a separate cascade
-  //  schedule leaks orphan-letter artifacts when the cursor doubles
-  //  back over a word mid-collapse. Word-level state plus the WordReveal
-  //  latching rules guarantee no orphan letters — re-activation just
-  //  means already-revealed chars stay revealed and the word continues
-  //  to bloom from the new anchor.
-  //
-  //  Reuses ripple physics options (rippleSpeed, rippleSpatialAtten,
-  //  ripplePostHit, rippleEdge) so the wave's character matches what
-  //  the standard `ripple` effect would produce.
-  // ════════════════════════════════════════════════════════════════════
-
-  const WaveReveal = {
-    frame(chars, ctx, opts) {
-      wordWaveFrame(chars, ctx, opts, false, opts.revealHoldMs);
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
-  //  BloomRipple — wave-driven sticky bloom layered with ripple styling.
-  //
-  //  Composition of two existing systems, run in sequence per char:
-  //
-  //    Phase 1 (this module): word-level activation using the same touch
-  //    criteria as WaveReveal (cursor proximity OR wave amplitude > c.seed)
-  //    and the same WordReveal bloom mechanic. STICKY — once a word is
-  //    revealed, its chars stay revealed; tickWord is called with sticky=true
-  //    so the COLLAPSING transition is skipped entirely.
-  //
-  //    Phase 2 (Effects.ripple, set by user as `effect: 'ripple'`): the
-  //    ordinary ripple physics drives c.bright per char from the wave
-  //    amplitude history. Renderer.colorAndGlowBloom (paired with this
-  //    mode via REVEAL_MODES) then lerps revealed chars from `revealColor`
-  //    (static gray) toward `wakeColor` (ripple peak white). Unrevealed
-  //    chars stay at the CSS cover color and ignore c.bright entirely.
-  //
-  //  Color contract:
-  //    - unrevealed         → CSS color (cover, e.g. dark gray)
-  //    - revealed, idle     → opts.revealColor (e.g. medium gray)
-  //    - revealed, ripple   → lerp from revealColor toward wakeColor
-  //
-  //  This keeps the static-revealed state visually distinct from the
-  //  ripple peak — the user picks gray for `revealColor` so peaks at
-  //  white read as wave activity, not as "this letter just appeared".
-  //
-  //  Frame body delegates to wordWaveFrame; the only difference from
-  //  WaveReveal is the sticky=true / holdMs=Infinity pair.
-  // ════════════════════════════════════════════════════════════════════
-
-  const BloomRipple = {
-    frame(chars, ctx, opts) {
-      wordWaveFrame(chars, ctx, opts, true, Infinity);
-    },
-  };
+  // Frozen rest target, returned when a char has no active influence so
+  // the integrators have a known-zero state without per-char allocation.
+  const REST = Object.freeze({
+    tx: 0,
+    ty: 0,
+    rot: 0,
+    scale: 1,
+    brightness: 0,
+    scramble: 0,
+    interior: false,
+  });
 
   // ════════════════════════════════════════════════════════════════════
   //  BurnReveal — paper-burn reveal over a twinkling ASCII mask ('burn').
@@ -613,7 +64,7 @@
   //  3. BLOOM-RIPPLE ADOPTION — burned chars join the bloom-ripple
   //     color contract (static `revealColor` at rest, lerped toward
   //     `wakeColor` by ripple brightness — pair with effect: 'ripple').
-  //     The dedicated writer (burnColorWriter below) prepends two hot
+  //     FrameEngine's dedicated burn writer prepends two hot
   //     states: cover→ember by heat while burning, then an ember→
   //     revealColor cooling flash over `burnCoolMs` right after
   //     combustion. Chars still cooling also keep radiating, which is
@@ -930,141 +381,530 @@
   };
 
   // ════════════════════════════════════════════════════════════════════
-  //  Effects — pure (dx, dy, dist, f, opts, ctx) → targetState.
+  //  Ripple — self-contained ring-physics water-wave subsystem.
   //
-  //  Sign convention: dx,dy = (charCenter − mouse). Positive dx means
-  //  char is to the right of cursor, so REPEL pushes it further right.
+  //  Stateless and dependency-free: knows nothing about CursorField,
+  //  Char, ctx, REST, or the rest of the framework. Given a char
+  //  position, the current time, a stamp history, and four tuning
+  //  constants, returns the wave-amplitude state at that char.
+  //  `Effects.ripple` is the thin adapter that bolts this onto the
+  //  Effects registry.
   //
-  //  Target schema (all fields optional, defaults are the rest state):
-  //    { tx, ty, rot, scale, brightness, scramble }
+  //  Input contract:
+  //    charX, charY  — char center, ANY coord space, but must match the
+  //                    coord space stamps were recorded in
+  //    time          — current time (DOMHighResTimeStamp ms)
+  //    stamps        — array of { x, y, t0 } disturbance origins, where
+  //                    (x, y) shares the char coord space and t0 shares
+  //                    `time`'s base. Read-only; never mutated.
+  //    speed         — px/ms; wavefront expansion rate
+  //    spatial       — px; wave amplitude is 1/e at this distance
+  //    postHit       — ms; exponential decay after wavefront passes
+  //    edge          — px; width of the swap band at the wavefront
   //
-  //  Effects with `.global = true` are called every frame regardless of
-  //  cursor proximity — they read state from ctx (e.g. ctx.stamps).
+  //  Returns:
+  //    { brightness, scramble, interior } — brightness/scramble in [0, 1];
+  //                                          interior is a boolean
+  //    null                                — char has no active wake
+  //                                          (caller treats as rest)
+  //
+  //  Frontier semantics: the moment ANY stamp's wavefront has fully
+  //  passed a char (edgeDist > edge AND timeFromHit > 0), `scramble` is
+  //  forced to 0 and `interior` is true — only the leading ring of the
+  //  wake scrambles glyphs; the bulk shows lit-but-original characters.
+  //  `interior` is exposed for downstream modules (e.g. RevealLayer) that
+  //  need the same "wave has passed" signal without re-deriving it.
   // ════════════════════════════════════════════════════════════════════
 
-  const Effects = {
-    // No motion / brightness / scramble. Useful when an instance only
-    // wants the RevealLayer feature (or any other independent module
-    // that doesn't depend on per-char effect output).
-    none() { return REST; },
-
-    // Pure displacement: chars pushed away from the cursor.
-    repel(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: dx * k, ty: dy * k };
+  const Ripple = {
+    // Tuning defaults — the framework's DEFAULTS mirrors these under
+    // `ripple*` keys so the physical constants are owned in one place.
+    DEFAULTS: {
+      speed:   0.55,
+      spatial: 180,
+      postHit: 380,
+      edge:    22,
     },
 
-    // Inverse of repel: chars pulled toward the cursor.
-    attract(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: -dx * k, ty: -dy * k };
-    },
+    compute(charX, charY, time, stamps, speed, spatial, postHit, edge) {
+      if (!stamps || stamps.length === 0) return null;
 
-    // Repel + scale + tilt — feels like soft jelly being pushed.
-    jelly(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: dx * k, ty: dy * k, rot: dx * f * 0.0015 * p.strength, scale: 1 + f * 0.6 };
-    },
+      let brightness = 0;
+      let frontierAmp = 0;
+      let interior = false;
 
-    // Vertical sine wave; cursor X drives phase, falloff modulates amplitude.
-    wave(dx, dy, dist, f, p, ctx) {
-      const phase = (ctx.charX - ctx.mouseX) * 0.02 + ctx.time * 0.004;
-      return { ty: Math.sin(phase) * f * p.strength };
-    },
+      for (let i = 0; i < stamps.length; i++) {
+        const s = stamps[i];
+        const ddx = charX - s.x;
+        const ddy = charY - s.y;
+        const dd = Math.sqrt(ddx * ddx + ddy * ddy);
 
-    // Chars under the cursor swell up — distance only scales, no displacement.
-    magnify(dx, dy, dist, f, p) {
-      return { ty: -f * p.strength * 0.4, scale: 1 + f * 0.9 };
-    },
+        const amplAtHit = Math.exp(-dd / spatial);
+        if (amplAtHit < 0.02) continue;
 
-    // Each char has a private direction; cursor controls intensity.
-    scatter(dx, dy, dist, f, p, ctx) {
-      const a = ctx.charSeed * Math.PI * 2;
-      const r = f * p.strength;
-      return { tx: Math.cos(a) * r, ty: Math.sin(a) * r, rot: ctx.charSeed * f * 0.6 };
-    },
+        const timeFromHit = time - (s.t0 + dd / speed);
 
-    // Tangential push — letters orbit around the cursor (90° CCW rotation of dx,dy).
-    swirl(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: -dy * k, ty: dx * k };
-    },
+        if (timeFromHit >= 0) {
+          const contrib = amplAtHit * Math.exp(-timeFromHit / postHit);
+          if (contrib > brightness) brightness = contrib;
+        }
 
-    // Rudimentary "matrix" wake: bright + glyph swap proportional to falloff.
-    // Kept for flavor; the physically-grounded effect is `ripple` below.
-    wake(dx, dy, dist, f) {
-      return { brightness: f, scramble: f };
-    },
-
-    // Brightness-only wake — glow trail without the glyph swap.
-    glow(dx, dy, dist, f) {
-      return { brightness: f };
-    },
-
-    // Top-level stochastic-density redaction. The glyph swap and
-    // morphing turnover live in the `Redact` module above; this slot
-    // is a routing flag — _tick checks `opts.effect === 'redact'` and
-    // dispatches to Redact directly. Returns REST so no transform/
-    // brightness/scramble target is produced.
-    redact() { return REST; },
-
-    // ── ripple — Effects-registry adapter onto the Ripple subsystem ───
-    //
-    // The physics lives in the `Ripple` module above; this slot exists so
-    // the registry can dispatch on `effect: 'ripple'`. Marked .global below
-    // so _tick calls it for every char regardless of cursor proximity —
-    // the wake reaches across the whole page, not just the falloff radius.
-    // Ignores dx/dy/f because wake amplitude is determined by stamp history,
-    // not by the current cursor distance.
-    //
-    // Memo: when wave / bloom-ripple modes are active, wordWaveFrame
-    // already computed Ripple for this char this frame and stashed it on
-    // c._rippleStash. Reuse it to avoid a second O(stamps) loop. Frame
-    // mismatch → stash is from a previous frame (or never populated, e.g.
-    // cursor mode) → recompute as before.
-    ripple(dx, dy, dist, f, p, ctx) {
-      const c = ctx.char;
-      if (c && c._rippleStashFrame === ctx.frameId) {
-        return c._rippleStash || REST;
+        const edgeDist = Math.abs(timeFromHit) * speed;
+        if (edgeDist < edge) {
+          const es = (1 - edgeDist / edge) * amplAtHit;
+          if (es > frontierAmp) frontierAmp = es;
+        } else if (timeFromHit > 0) {
+          // This stamp's wavefront has fully passed — char is in the wake bulk.
+          interior = true;
+        }
       }
-      return Ripple.compute(
-        ctx.charX, ctx.charY, ctx.time, ctx.stamps,
-        p.rippleSpeed, p.rippleSpatialAtten, p.ripplePostHit, p.rippleEdge,
-      ) || REST;
+
+      const scramble = interior ? 0 : frontierAmp;
+      return { brightness, scramble, interior };
     },
   };
 
-  Effects.ripple.global = true;
+  // Owns the internal memo protocol shared by wave reveal and the ripple effect.
+  // Reveal sampling refreshes the memo; effect sampling only consumes an exact-
+  // frame memo and otherwise computes from the effect context without caching.
+  const RippleSampler = {
+    initChar(c) {
+      c._rippleStash = null;
+      c._rippleStashFrame = -1;
+    },
 
-  // ════════════════════════════════════════════════════════════════════
-  //  GlyphPickers — strategies for choosing the substituted glyph.
-  // ════════════════════════════════════════════════════════════════════
+    sampleForReveal(c, ctx, opts) {
+      const sample = compute(c.hx, c.hy, ctx, opts);
+      c._rippleStash = sample;
+      c._rippleStashFrame = ctx.frameId;
+      return sample;
+    },
 
-  function pickSymbol(opts) {
-    const s = opts.swapSymbols;
-    if (!s || s.length === 0) return null;
-    return s.charAt((Math.random() * s.length) | 0);
+    sampleForEffect(ctx, opts) {
+      const c = ctx.char;
+      if (c && c._rippleStashFrame === ctx.frameId) return c._rippleStash;
+      return compute(ctx.charX, ctx.charY, ctx, opts);
+    },
+  };
+
+  function compute(charX, charY, ctx, opts) {
+    return Ripple.compute(
+      charX, charY, ctx.time, ctx.stamps,
+      opts.rippleSpeed, opts.rippleSpatialAtten,
+      opts.ripplePostHit, opts.rippleEdge,
+    );
   }
 
-  const GlyphPickers = {
-    // Uniform random pick from `glyphPool`. Matrix-style chaos.
-    pool(originalChar, opts) {
-      const pool = opts.glyphPool;
-      if (!pool || pool.length === 0) return null;
-      return pool.charAt((Math.random() * pool.length) | 0);
+  // ════════════════════════════════════════════════════════════════════
+  //  WordReveal — shared word-level reveal orchestration.
+  //
+  //  Both RevealLayer (cursor mode, sticky) and WaveReveal (wave mode,
+  //  reversible) sit on top of this module. The activation/deactivation
+  //  unit is the WORD; per-char `c.revealed` is derived from the word's
+  //  state plus this char's distance from the word's anchor letter.
+  //
+  //  Why: a per-char activation model with a separate cascade
+  //  choreography leaks orphan-letter artifacts when the cursor doubles
+  //  back — a returning wave can re-activate scattered letters mid-
+  //  collapse while others continue un-revealing per their stale
+  //  schedule. Word-level state with derived per-char render guarantees
+  //  any active phase keeps already-revealed chars revealed (only
+  //  flips false → true), and any collapse phase only flips true →
+  //  false. Re-activation simply latches: existing revealed chars stay
+  //  revealed; chars that had un-revealed re-bloom from the new anchor.
+  //
+  //  Per-word state object (created by Splitter, shared by all sibling
+  //  chars via `c.wordState`):
+  //
+  //    chars              — Char[] members of the word
+  //    active             — boolean: in ACTIVE phase
+  //    activatedAt        — timestamp the current ACTIVE phase began
+  //    anchorIdx          — index in chars[] of the activator letter
+  //    collapseAt         — 0 or timestamp the COLLAPSING phase began
+  //    lastTouchedAt      — most recent frame any char was touched
+  //    maxDistFromAnchor  — max |i - anchorIdx| across word, set on activation
+  //    _touchedThisFrame  — per-frame scratch: any char touched this frame?
+  //    _anchorCandidate*  — per-frame scratch: closest-to-cursor candidate
+  //
+  //  Animation rules (per char per frame, applied by applyChar):
+  //
+  //    active   →  c.revealed = c.revealed || (now >= activatedAt + dist*stepMs)
+  //    collapse →  c.revealed = c.revealed && (now <  collapseAt + (maxDist - dist)*stepMs)
+  //    idle     →  c.revealed = false
+  //
+  //  Active phase only flips chars false→true; collapse only true→false.
+  //  This is the key invariant that keeps back-and-forth tracks clean.
+  //
+  //  Anchor selection: on word activation, the cursor-closest touched
+  //  char becomes the anchor. Anchor is locked while word is active —
+  //  subsequent touches refresh `lastTouchedAt` but don't move the
+  //  anchor. A re-activation after collapse picks a fresh anchor.
+  // ════════════════════════════════════════════════════════════════════
+
+  const WordReveal = {
+    // Construct a fresh per-word state record. Splitter calls this once
+    // per word, then attaches the resulting object to every member char
+    // via `c.wordState` (shared reference).
+    makeWord(chars) {
+      return {
+        chars,
+        active: false,
+        activatedAt: 0,
+        anchorIdx: 0,
+        collapseAt: 0,
+        lastTouchedAt: 0,
+        maxDistFromAnchor: 0,
+        // Per-frame scratch — reset by resetScratch() at frame start.
+        _touchedThisFrame: false,
+        _anchorCandidateIdx: -1,
+        _anchorCandidateDistSq: Infinity,
+      };
     },
 
-    // Mostly toggle letter case (A↔a); ~8% of the time draw a symbol
-    // from `swapSymbols`. Non-letters always draw a symbol. Closer to the
-    // Pudgy Penguins reference effect — feels typographic, not glitchy.
-    caseFlip(originalChar, opts) {
-      if (Math.random() < 0.08) return pickSymbol(opts);
-      const lower = originalChar.toLowerCase();
-      const upper = originalChar.toUpperCase();
-      if (lower !== upper) return originalChar === upper ? lower : upper;
-      return pickSymbol(opts);
+    // Reset per-frame scratch fields. Caller should invoke once per word
+    // per frame, before any touch() calls for that frame.
+    resetScratch(w) {
+      w._touchedThisFrame = false;
+      w._anchorCandidateIdx = -1;
+      w._anchorCandidateDistSq = Infinity;
+    },
+
+    // Mark a char as touched this frame; track closest-to-cursor as the
+    // anchor candidate (used only if the word activates this frame —
+    // already-active words keep their existing anchor).
+    touch(c, distSqToCursor) {
+      const w = c.wordState;
+      if (!w) return;
+      w._touchedThisFrame = true;
+      if (distSqToCursor < w._anchorCandidateDistSq) {
+        w._anchorCandidateDistSq = distSqToCursor;
+        w._anchorCandidateIdx = c.indexInWord;
+      }
+    },
+
+    // Per-word state transition. Caller invokes once per word per frame
+    // after all touch() calls. `sticky=true` skips the active→collapse
+    // transition (RevealLayer's lottery-ticket model).
+    tickWord(w, now, holdMs, sticky) {
+      if (w._touchedThisFrame) {
+        w.lastTouchedAt = now;
+        if (!w.active) {
+          w.active = true;
+          w.activatedAt = now;
+          w.anchorIdx = w._anchorCandidateIdx;
+          w.collapseAt = 0;
+          const a = w.anchorIdx;
+          const n = w.chars.length;
+          w.maxDistFromAnchor = a > n - 1 - a ? a : n - 1 - a;
+        }
+      } else if (!sticky && w.active && w.lastTouchedAt + holdMs <= now) {
+        w.active = false;
+        w.collapseAt = now;
+      }
+    },
+
+    // Per-char render. Latches c.revealed via the active/collapse rules
+    // documented in the banner above. Caller invokes once per char per
+    // frame after tickWord has settled the per-word state.
+    applyChar(c, now, stepMs) {
+      const w = c.wordState;
+      if (!w) { c.revealed = false; return; }
+      const di = c.indexInWord - w.anchorIdx;
+      const dist = di < 0 ? -di : di;
+      if (w.active) {
+        if (!c.revealed && now >= w.activatedAt + dist * stepMs) c.revealed = true;
+      } else if (w.collapseAt > 0) {
+        const remain = w.collapseAt + (w.maxDistFromAnchor - dist) * stepMs;
+        if (c.revealed && now >= remain) c.revealed = false;
+      } else {
+        c.revealed = false;
+      }
+    },
+
+    // Reset a word's persistent state to IDLE. Called by RevealLayer.attach
+    // when the reveal text changes (a fresh start should clear any
+    // active/collapsing animation in progress).
+    resetWord(w) {
+      w.active = false;
+      w.activatedAt = 0;
+      w.anchorIdx = 0;
+      w.collapseAt = 0;
+      w.lastTouchedAt = 0;
+      w.maxDistFromAnchor = 0;
     },
   };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  RevealLayer — optional two-layer text overlay (cursor mode).
+  //
+  //  Pairs each visible char with a counterpart from a "lower" string,
+  //  supplied via `options.revealText` or a `data-reveal` attribute on
+  //  the host element. Activation is purely cursor-proximity driven —
+  //  no wave physics, no diffusion, no shared state with any effect.
+  //
+  //  Trigger: when ANY char in a word is within `revealRadius` of the
+  //  cursor, the word activates with the cursor-closest touched char as
+  //  the anchor. The whole word then blooms outward letter-by-letter
+  //  per `revealWordStepMs`. Sticky — once activated, words never
+  //  collapse for the lifetime of the instance (lottery-ticket model).
+  //
+  //  Color is pinned discretely via Renderer.colorAndGlow when
+  //  `c.revealed` is true; no brightness modulation, no two-state ramp.
+  //
+  //  No setup → no behavior. With nothing in `revealText` and no
+  //  `data-reveal` attribute, `frame` does nothing and the module is
+  //  effectively absent.
+  // ════════════════════════════════════════════════════════════════════
+
+  const RevealLayer = {
+    // Per-char field ownership. The per-word state lives on `c.wordState`
+    // (intrinsic, populated by Splitter); this module owns only the
+    // chars' lower-layer glyph + pinned-color latch.
+    //
+    //   revealChar   — null | string : lower-layer glyph (set by attach)
+    //   revealed     — boolean       : derived per frame by WordReveal
+    //   colorPinned  — boolean       : renderer-side latch paired with revealed
+    initChar(c) {
+      c.revealChar = null;
+      c.revealed = false;
+      c.colorPinned = false;
+    },
+
+    // Lifecycle hook: react to options changes from TextRippling.update().
+    // Owned cleanup logic lives here, not in update(), so adding a new
+    // reveal-related option doesn't require editing the façade.
+    onUpdate(prev, curr, chars, element) {
+      if (curr.revealText !== prev.revealText) {
+        RevealLayer.attach(chars, curr, element);
+      }
+    },
+
+    // Walk chars[] and fill `revealChar` per visible position. Sources
+    // (in priority order):
+    //   1. `opts.revealText` (string)
+    //   2. `element.dataset.reveal` (HTML `data-reveal="..."` fallback)
+    //   3. neither — feature is off; all `revealChar` set to null
+    // Length policy: short reveal pads with null (no swap on the tail —
+    // upper still shows there); long reveal is truncated to chars.length.
+    // Spaces in the reveal string are stripped so the mapping aligns
+    // with Splitter's visible-char-only chars[] (Splitter doesn't emit
+    // spans for whitespace either). Also resets every word's state to
+    // IDLE so a fresh reveal text starts cleanly.
+    attach(chars, opts, element) {
+      let raw = opts.revealText;
+      if (!raw && element && element.dataset && element.dataset.reveal) {
+        raw = element.dataset.reveal;
+      }
+      const lower = [];
+      if (raw) {
+        for (const ch of Array.from(raw)) {
+          if (!/\s/.test(ch)) lower.push(ch);
+        }
+      }
+      const seenWords = new Set();
+      for (let i = 0; i < chars.length; i++) {
+        chars[i].revealChar = raw && i < lower.length ? lower[i] : null;
+        chars[i].revealed = false;
+        const w = chars[i].wordState;
+        if (w && !seenWords.has(w)) { seenWords.add(w); WordReveal.resetWord(w); }
+      }
+    },
+
+    // Per-frame orchestrator (cursor mode, sticky). Runs three passes:
+    //   1. touch detection — any char within `revealRadius` of cursor
+    //      marks its word as touched, with the cursor-closest char
+    //      becoming the anchor candidate.
+    //   2. word state transition (sticky → never collapses; tickWord
+    //      with sticky=true only handles the IDLE→ACTIVE direction).
+    //   3. per-char render — c.revealed latched via WordReveal.applyChar.
+    //
+    // Module-private scratch Set tracks per-frame "words seen", used to
+    // dedupe and to limit tickWord calls to words actually present.
+    frame(chars, ctx, opts) {
+      const stepMs = opts.revealWordStepMs;
+      const innerR = opts.revealRadius;
+      const innerRSq = innerR * innerR;
+      _wordScratch.clear();
+
+      for (let i = 0; i < chars.length; i++) {
+        const c = chars[i];
+        if (c.revealChar == null) { c.revealed = false; continue; }
+        const w = c.wordState;
+        if (!w) continue;
+        if (!_wordScratch.has(w)) { WordReveal.resetScratch(w); _wordScratch.add(w); }
+        const dx = c.hx - ctx.mouseX;
+        const dy = c.hy - ctx.mouseY;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < innerRSq) WordReveal.touch(c, distSq);
+      }
+
+      for (const w of _wordScratch) WordReveal.tickWord(w, ctx.time, Infinity, true);
+
+      for (let i = 0; i < chars.length; i++) {
+        const c = chars[i];
+        if (c.revealChar == null) continue;
+        WordReveal.applyChar(c, ctx.time, stepMs);
+      }
+    },
+  };
+
+  // Module-private scratch Set, reused frame-to-frame to avoid per-frame
+  // allocation. RevealLayer.frame and wordWaveFrame (the shared core
+  // behind WaveReveal and BloomRipple) both borrow it during their own
+  // pass — they don't run concurrently (revealMode dispatch is
+  // single-mode per instance per frame).
+  const _wordScratch = new Set();
+
+  // ════════════════════════════════════════════════════════════════════
+  //  wordWaveFrame — shared three-pass orchestrator behind both
+  //  WaveReveal (sticky=false) and BloomRipple (sticky=true).
+  //
+  //  Same shape as RevealLayer.frame: touch → tickWord → applyChar. The
+  //  touch predicate is cursor proximity OR wave amplitude > c.seed
+  //  (per the WaveReveal banner below). The two modules differ only in
+  //  the (sticky, holdMs) pair handed to WordReveal.tickWord — sticky
+  //  freezes the active→collapse transition, holdMs sets the idle
+  //  window for the non-sticky path.
+  // ════════════════════════════════════════════════════════════════════
+
+  function wordWaveFrame(chars, ctx, opts, sticky, holdMs) {
+    const stepMs = opts.revealWordStepMs;
+    const innerR = opts.revealRadius;
+    const innerRSq = innerR * innerR;
+    _wordScratch.clear();
+
+    for (let i = 0; i < chars.length; i++) {
+      const c = chars[i];
+      if (c.revealChar == null) { c.revealed = false; continue; }
+      const w = c.wordState;
+      if (!w) continue;
+      if (!_wordScratch.has(w)) { WordReveal.resetScratch(w); _wordScratch.add(w); }
+
+      const dx = c.hx - ctx.mouseX;
+      const dy = c.hy - ctx.mouseY;
+      const distSq = dx * dx + dy * dy;
+
+      let touched = distSq < innerRSq;
+      if (!touched) {
+        // Stash the result so Effects.ripple (when paired with this
+        // mode, e.g. bloom-ripple's effect: 'ripple') can reuse it
+        // instead of paying the per-stamp loop a second time. Note:
+        // when the char is inside cursor proximity (touched=true here)
+        // we skip the call entirely — Effects.ripple will recompute
+        // for that handful of chars, which is negligible vs the bulk.
+        const r = RippleSampler.sampleForReveal(c, ctx, opts);
+        if (r && r.brightness > c.seed) touched = true;
+      }
+      if (touched) WordReveal.touch(c, distSq);
+    }
+
+    for (const w of _wordScratch) WordReveal.tickWord(w, ctx.time, holdMs, sticky);
+
+    for (let i = 0; i < chars.length; i++) {
+      const c = chars[i];
+      if (c.revealChar == null) continue;
+      WordReveal.applyChar(c, ctx.time, stepMs);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  WaveReveal — reversible wave-driven dithered two-layer overlay
+  //               with word-level activation.
+  //
+  //  Sibling to RevealLayer. Same two-layer setup (revealChar per Char,
+  //  revealColor as the pinned destination) and the same renderer hookup
+  //  (Renderer.colorAndGlow's c.revealed branch handles both pin AND
+  //  unpin transitions). DIFFERENCES from RevealLayer:
+  //
+  //    RevealLayer  → cursor proximity, sticky (no collapse).
+  //    WaveReveal   → cursor proximity OR wave amplitude > c.seed,
+  //                   reversible — word collapses back after holdMs of
+  //                   no touch.
+  //
+  //  Both use the shared WordReveal module: per-word activation/collapse
+  //  state plus per-char animation derived from word state + distance
+  //  from the word's anchor letter. See the WordReveal banner above.
+  //
+  //  Touch criteria (per char per frame):
+  //    1. distance to cursor < `revealRadius`  →  touched (always-flip
+  //       core; ensures sub-frame amplitude peaks under the cursor
+  //       can never be missed even if the per-char seed is high).
+  //    2. wave amplitude (Ripple.compute) > c.seed → touched (the
+  //       per-char seed gives the dither — a wave at half amplitude
+  //       touches roughly half the chars in its reach).
+  //
+  //  Any touched char in a word marks the word as touched-this-frame.
+  //  The cursor-closest touched char becomes the activation anchor.
+  //  Word stays active while any of its chars is touched any frame
+  //  within `revealHoldMs`; after that idle window the word collapses,
+  //  letters un-revealing furthest-from-anchor first.
+  //
+  //  Why word-level: a per-char activation model with a separate cascade
+  //  schedule leaks orphan-letter artifacts when the cursor doubles
+  //  back over a word mid-collapse. Word-level state plus the WordReveal
+  //  latching rules guarantee no orphan letters — re-activation just
+  //  means already-revealed chars stay revealed and the word continues
+  //  to bloom from the new anchor.
+  //
+  //  Reuses ripple physics options (rippleSpeed, rippleSpatialAtten,
+  //  ripplePostHit, rippleEdge) so the wave's character matches what
+  //  the standard `ripple` effect would produce.
+  // ════════════════════════════════════════════════════════════════════
+
+  const WaveReveal = {
+    frame(chars, ctx, opts) {
+      wordWaveFrame(chars, ctx, opts, false, opts.revealHoldMs);
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  BloomRipple — wave-driven sticky bloom layered with ripple styling.
+  //
+  //  Composition of two existing systems, run in sequence per char:
+  //
+  //    Phase 1 (this module): word-level activation using the same touch
+  //    criteria as WaveReveal (cursor proximity OR wave amplitude > c.seed)
+  //    and the same WordReveal bloom mechanic. STICKY — once a word is
+  //    revealed, its chars stay revealed; tickWord is called with sticky=true
+  //    so the COLLAPSING transition is skipped entirely.
+  //
+  //    Phase 2 (Effects.ripple, set by user as `effect: 'ripple'`): the
+  //    ordinary ripple physics drives c.bright per char from the wave
+  //    amplitude history. Renderer.colorAndGlowBloom (paired with this
+  //    mode by FrameEngine) then lerps revealed chars from `revealColor`
+  //    (static gray) toward `wakeColor` (ripple peak white). Unrevealed
+  //    chars stay at the CSS cover color and ignore c.bright entirely.
+  //
+  //  Color contract:
+  //    - unrevealed         → CSS color (cover, e.g. dark gray)
+  //    - revealed, idle     → opts.revealColor (e.g. medium gray)
+  //    - revealed, ripple   → lerp from revealColor toward wakeColor
+  //
+  //  This keeps the static-revealed state visually distinct from the
+  //  ripple peak — the user picks gray for `revealColor` so peaks at
+  //  white read as wave activity, not as "this letter just appeared".
+  //
+  //  Frame body delegates to wordWaveFrame; the only difference from
+  //  WaveReveal is the sticky=true / holdMs=Infinity pair.
+  // ════════════════════════════════════════════════════════════════════
+
+  const BloomRipple = {
+    frame(chars, ctx, opts) {
+      wordWaveFrame(chars, ctx, opts, true, Infinity);
+    },
+  };
+
+  // Pointer events and DOMRects are viewport-relative. Physics runs in page
+  // space so stamps stay attached to the document while the viewport scrolls.
+  // Keep the browser fallback policy here so every producer crosses the same
+  // coordinate boundary.
+  function clientToPageX(clientX) {
+    return clientX + (window.scrollX || window.pageXOffset || 0);
+  }
+
+  function clientToPageY(clientY) {
+    return clientY + (window.scrollY || window.pageYOffset || 0);
+  }
 
   // ════════════════════════════════════════════════════════════════════
   //  CursorField — global pointer state + wave-stamp ring buffer.
@@ -1111,8 +951,8 @@
       const dy = y - lastStampY;
       if (dx * dx + dy * dy < STAMP_MIN_DIST_SQ) return;
       state.stamps.push({
-        x: x + (window.scrollX || window.pageXOffset || 0),
-        y: y + (window.scrollY || window.pageYOffset || 0),
+        x: clientToPageX(x),
+        y: clientToPageY(y),
         t0: t,
       });
       lastStampX = x;
@@ -1217,6 +1057,274 @@
 
     return { add, remove };
   })();
+
+  // ════════════════════════════════════════════════════════════════════
+  //  Falloffs — distance-to-radius weighting curves, range [0..1].
+  //  Effects use these to scale their output by cursor proximity.
+  // ════════════════════════════════════════════════════════════════════
+
+  const Falloffs = {
+    gaussian: (d, r) => Math.exp(-((d / r) * (d / r)) * 2.5),
+    linear:   (d, r) => Math.max(0, 1 - d / r),
+    inverse:  (d, r) => 1 / (1 + (d / r) * (d / r) * 4),
+    smooth:   (d, r) => {
+      const t = Math.max(0, 1 - d / r);
+      return t * t * (3 - 2 * t);
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  Effects — pure (dx, dy, dist, f, opts, ctx) → targetState.
+  //
+  //  Sign convention: dx,dy = (charCenter − mouse). Positive dx means
+  //  char is to the right of cursor, so REPEL pushes it further right.
+  //
+  //  Target schema (all fields optional, defaults are the rest state):
+  //    { tx, ty, rot, scale, brightness, scramble }
+  //
+  //  Effects with `.global = true` are called every frame regardless of
+  //  cursor proximity — they read state from ctx (e.g. ctx.stamps).
+  // ════════════════════════════════════════════════════════════════════
+
+  const Effects = {
+    // No motion / brightness / scramble. Useful when an instance only
+    // wants the RevealLayer feature (or any other independent module
+    // that doesn't depend on per-char effect output).
+    none() { return REST; },
+
+    // Pure displacement: chars pushed away from the cursor.
+    repel(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: dx * k, ty: dy * k };
+    },
+
+    // Inverse of repel: chars pulled toward the cursor.
+    attract(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: -dx * k, ty: -dy * k };
+    },
+
+    // Repel + scale + tilt — feels like soft jelly being pushed.
+    jelly(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: dx * k, ty: dy * k, rot: dx * f * 0.0015 * p.strength, scale: 1 + f * 0.6 };
+    },
+
+    // Vertical sine wave; cursor X drives phase, falloff modulates amplitude.
+    wave(dx, dy, dist, f, p, ctx) {
+      const phase = (ctx.charX - ctx.mouseX) * 0.02 + ctx.time * 0.004;
+      return { ty: Math.sin(phase) * f * p.strength };
+    },
+
+    // Chars under the cursor swell up — distance only scales, no displacement.
+    magnify(dx, dy, dist, f, p) {
+      return { ty: -f * p.strength * 0.4, scale: 1 + f * 0.9 };
+    },
+
+    // Each char has a private direction; cursor controls intensity.
+    scatter(dx, dy, dist, f, p, ctx) {
+      const a = ctx.charSeed * Math.PI * 2;
+      const r = f * p.strength;
+      return { tx: Math.cos(a) * r, ty: Math.sin(a) * r, rot: ctx.charSeed * f * 0.6 };
+    },
+
+    // Tangential push — letters orbit around the cursor (90° CCW rotation of dx,dy).
+    swirl(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: -dy * k, ty: dx * k };
+    },
+
+    // Rudimentary "matrix" wake: bright + glyph swap proportional to falloff.
+    // Kept for flavor; the physically-grounded effect is `ripple` below.
+    wake(dx, dy, dist, f) {
+      return { brightness: f, scramble: f };
+    },
+
+    // Brightness-only wake — glow trail without the glyph swap.
+    glow(dx, dy, dist, f) {
+      return { brightness: f };
+    },
+
+    // Top-level stochastic-density redaction. The glyph swap and
+    // morphing turnover live in the `Redact` module above; this slot
+    // is a routing flag — _tick checks `opts.effect === 'redact'` and
+    // dispatches to Redact directly. Returns REST so no transform/
+    // brightness/scramble target is produced.
+    redact() { return REST; },
+
+    // ── ripple — Effects-registry adapter onto the Ripple subsystem ───
+    //
+    // The physics lives in the `Ripple` module above; this slot exists so
+    // the registry can dispatch on `effect: 'ripple'`. Marked .global below
+    // so _tick calls it for every char regardless of cursor proximity —
+    // the wake reaches across the whole page, not just the falloff radius.
+    // Ignores dx/dy/f because wake amplitude is determined by stamp history,
+    // not by the current cursor distance.
+    //
+    // Memo: when wave / bloom-ripple modes are active, wordWaveFrame
+    // already computed Ripple for this char this frame and stashed it on
+    // c._rippleStash. Reuse it to avoid a second O(stamps) loop. Frame
+    // mismatch → stash is from a previous frame (or never populated, e.g.
+    // cursor mode) → recompute as before.
+    ripple(dx, dy, dist, f, p, ctx) {
+      return RippleSampler.sampleForEffect(ctx, p) || REST;
+    },
+  };
+
+  Effects.ripple.global = true;
+
+  // ════════════════════════════════════════════════════════════════════
+  //  GlyphPickers — strategies for choosing the substituted glyph.
+  // ════════════════════════════════════════════════════════════════════
+
+  function pickSymbol(opts) {
+    const s = opts.swapSymbols;
+    if (!s || s.length === 0) return null;
+    return s.charAt((Math.random() * s.length) | 0);
+  }
+
+  const GlyphPickers = {
+    // Uniform random pick from `glyphPool`. Matrix-style chaos.
+    pool(originalChar, opts) {
+      const pool = opts.glyphPool;
+      if (!pool || pool.length === 0) return null;
+      return pool.charAt((Math.random() * pool.length) | 0);
+    },
+
+    // Mostly toggle letter case (A↔a); ~8% of the time draw a symbol
+    // from `swapSymbols`. Non-letters always draw a symbol. Closer to the
+    // Pudgy Penguins reference effect — feels typographic, not glitchy.
+    caseFlip(originalChar, opts) {
+      if (Math.random() < 0.08) return pickSymbol(opts);
+      const lower = originalChar.toLowerCase();
+      const upper = originalChar.toUpperCase();
+      if (lower !== upper) return originalChar === upper ? lower : upper;
+      return pickSymbol(opts);
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  DEFAULTS — every option is a knob exposed to the user.
+  // ════════════════════════════════════════════════════════════════════
+
+  const DEFAULTS = {
+    // Effect & shape
+    effect:      'repel',
+    radius:      160,           // px — proximity falloff radius (most effects)
+    strength:    30,            // effect-specific magnitude
+    falloff:     'gaussian',    // see Falloffs registry
+    // Spring (transform channel)
+    spring:      0.18,          // 0..1 — stiffness toward target
+    damping:     0.72,          // 0..1 — velocity decay per frame
+    // Brightness (asymmetric lerp)
+    wakeAttack:  0.55,          // 0..1 — rise rate when target > current
+    wakeDecay:   0.12,          // 0..1 — fall rate when target < current (lower = longer trail)
+    wakeColor:   '#ffffff',     // CSS color — destination of the brightness lerp
+    // Glyph swap
+    swapMode:    'caseFlip',    // see GlyphPickers registry
+    swapInterval: 70,           // ms between per-char re-rolls while scrambling
+    glyphPool:   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*+=<>?/',
+    swapSymbols: '!@#$%^&*+=<>?/|~',
+    // Ripple physics — physical constants live in the Ripple subsystem;
+    // these keys mirror them under prefixed names for the flat options bag.
+    rippleSpeed:        Ripple.DEFAULTS.speed,    // px/ms — wavefront expansion rate
+    rippleSpatialAtten: Ripple.DEFAULTS.spatial,  // px — wave amplitude is 1/e at this distance
+    ripplePostHit:      Ripple.DEFAULTS.postHit,  // ms — exp decay after wavefront passes
+    rippleEdge:         Ripple.DEFAULTS.edge,     // px — width of the swap band at the wavefront
+    // Reveal layer — independent of effect. All three modes are word-level
+    // (see WordReveal banner): touching any char activates its whole
+    // word and the word blooms outward letter-by-letter from the
+    // cursor-closest anchor. Settings:
+    //   'cursor' (default) — sticky proximity reveal (RevealLayer)
+    //   'wave'             — reversible wave-driven (WaveReveal)
+    //   'bloom-ripple'     — sticky wave-driven bloom; pair with
+    //                        effect: 'ripple' to stylize revealed words
+    //                        (BloomRipple + Renderer.colorAndGlowBloom)
+    //   'burn'             — paper-burn reveal of the element's OWN text
+    //                        from under a twinkling procedural mask
+    //                        (BurnReveal; char-level, ignores revealText;
+    //                        pair with effect: 'ripple' for the styling)
+    //   any other value    — none runs (still allows revealText to be set
+    //                        without effect, e.g., for plugin-driven reveal)
+    revealMode:      'cursor',
+    revealText:      '',        // lower-layer string (1:1 to upper's visible chars); '' disables the feature
+    revealColor:     '',        // CSS color the revealed glyph is pinned to; '' falls back to wakeColor
+    revealRadius:     60,       // px — chars within this distance of the cursor count as touched
+    revealHoldMs:     3000,     // ms — wave mode: how long a word stays active past its last touched frame
+    revealWordStepMs: 30,       // ms — per-char step for the outward bloom (and inverse-collapse) within a word
+    // Burn reveal — see BurnReveal module above. Active when revealMode:
+    // 'burn'. Physical constants are owned by BurnReveal.DEFAULTS and
+    // mirrored here under prefixed names (same pattern as ripple*).
+    burnRadius:       BurnReveal.DEFAULTS.radius,       // px — cursor ignition reach
+    burnRate:         BurnReveal.DEFAULTS.rate,         // heat/s at cursor center
+    burnSmolderRate:  BurnReveal.DEFAULTS.smolderRate,  // heat/s — self-burn + neighbor radiation scale
+    burnSmolderReach: BurnReveal.DEFAULTS.smolderReach, // px — radiation reach of a burning char
+    burnIgnite:       BurnReveal.DEFAULTS.ignite,       // 0..1 — kindling point; past it a char always completes
+    burnCoolMs:       BurnReveal.DEFAULTS.coolMs,       // ms — ember flash after combustion
+    burnEmberColor:   BurnReveal.DEFAULTS.emberColor,   // CSS color of the burning edge
+    burnTwinkleMs:    BurnReveal.DEFAULTS.twinkleMs,    // ms — mean mask re-roll interval
+    // Redact effect — see Redact module above. Active when effect: 'redact'.
+    // Visual is a CSS background bar painted on a per-char cover layer
+    // (see Splitter banner) — no glyph swap, so redaction is layout- and
+    // font-metric-neutral. The bar fills the original char's bounding box.
+    redactRadius:       80,     // px — inner radius A; chars within this are always redacted
+    redactFringe:       120,    // px — band width; outer radius B = A + this
+    redactTurnoverMs:   500,    // ms — period between morphing swaps (default 2/sec)
+    redactTurnoverFrac: 0.30,   // 0..1 — fraction of in-band redacted chars swapped per turn
+    redactColor:        '',     // CSS color for the redact bar; '' falls back to currentColor (inherits text color)
+    // Layout / DOM
+    splitWords:  true,          // wrap whole words in inline-block (prevents mid-word wrap)
+    remeasureOn: 'auto',        // 'auto' | 'manual'
+    className:   'tr-char',     // base class for char spans
+  };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  Color — parse "#rgb" / "#rrggbb" / "rgb(...)" / "rgba(...)" → [r,g,b]
+  // ════════════════════════════════════════════════════════════════════
+
+  const Color = {
+    parse(str) {
+      if (!str) return [255, 255, 255];
+      if (str.charAt(0) === '#') {
+        let hex = str.slice(1);
+        if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+        if (hex.length === 6) {
+          const n = parseInt(hex, 16);
+          if (!isNaN(n)) return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+        }
+      }
+      const m = str.match(/(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)/);
+      if (m) return [+m[1] | 0, +m[2] | 0, +m[3] | 0];
+      return [255, 255, 255];
+    },
+  };
+
+  // Fixed lifecycle sequencing for the feature modules that share Char state.
+  // Keep method lookup on the public module objects dynamic: consumers may
+  // replace those methods through the established TextRippling attachments.
+  const FeatureLifecycle = {
+    initChar(c) {
+      RevealLayer.initChar(c);
+      BurnReveal.initChar(c);
+      Redact.initChar(c);
+    },
+
+    attach(chars, options, element) {
+      RevealLayer.attach(chars, options, element);
+      if (options.revealMode === 'burn') BurnReveal.attach(chars, options);
+    },
+
+    update(prev, curr, chars, element) {
+      // Different reveal writers assign different meanings to these latches.
+      if (prev.revealMode !== curr.revealMode) {
+        for (const c of chars) { c.colorPinned = false; c.wasLit = false; }
+      }
+
+      RevealLayer.onUpdate(prev, curr, chars, element);
+      BurnReveal.onUpdate(prev, curr, chars);
+      Redact.onUpdate(prev, curr, chars);
+    },
+  };
 
   // ════════════════════════════════════════════════════════════════════
   //  Splitter — text → Char[].
@@ -1352,18 +1460,13 @@
         originalChar,
         // Deterministic seed for effects/strategies that want per-char jitter.
         seed: Math.random(),
-        // Per-frame Ripple.compute memo. wordWaveFrame populates this
-        // when it runs (wave / bloom-ripple modes); Effects.ripple checks
-        // _rippleStashFrame === ctx.frameId before recomputing. Pre-init
-        // both fields so V8 keeps the Char shape monomorphic.
-        _rippleStash: null,
-        _rippleStashFrame: -1,
       };
-      // Per-module field hand-off — see each module's initChar comment
-      // for the field set it owns.
-      RevealLayer.initChar(c);
-      BurnReveal.initChar(c);
-      Redact.initChar(c);
+      // Keep sampler fields before feature fields so every Char has the same
+      // stable property order as before this ownership move.
+      RippleSampler.initChar(c);
+      // Per-module field hand-off. The lifecycle owns the fixed order;
+      // each feature's public initChar hook still owns its own fields.
+      FeatureLifecycle.initChar(c);
       return c;
     },
 
@@ -1589,331 +1692,55 @@
     },
   };
 
-  // ════════════════════════════════════════════════════════════════════
-  //  Reveal mode strategy table. Each entry bundles (a) the per-frame
-  //  word orchestrator, (b) the per-char color writer that pairs with
-  //  it, (c) the resting-glyph resolver, and (d) the scramble gate.
-  //  _tick looks up one bundle by `opts.revealMode` and dispatches
-  //  through it — adding a new mode means adding one entry here, not
-  //  threading parallel if-ladders through _tick.
-  //
-  //  The mode→writer pairing was previously implicit (a `isBloomRipple`
-  //  flag in _tick chose the writer), which left it possible to add a
-  //  new mode and forget to wire its writer. Bundling makes the
-  //  coupling explicit.
-  //
-  //  Color writer signature: (c, x) where x is a per-frame ctx with
-  //  resolved color endpoints — baseRgb, wakeRgb, wakeStr, revealRgb,
-  //  revealStr (revealRgb/Str fall back to wakeRgb/Str when revealColor
-  //  is unset) — plus emberRgb/emberStr/emberHotRgb (burn mode), the
-  //  frame time, and the options bag. Writers internally derive any
-  //  per-char state they need.
-  // ════════════════════════════════════════════════════════════════════
-
-  // Default writer — paired with cursor and wave modes. Picks lerp
-  // endpoint per char based on whether the lower (reveal) layer is
-  // currently shown for that char.
-  function defaultColorWriter(c, x) {
-    const showLower = c.revealed && c.revealChar != null;
-    const lerpRgb = showLower ? x.revealRgb : x.wakeRgb;
-    const lerpStr = showLower ? x.revealStr : x.wakeStr;
-    Renderer.colorAndGlow(c, x.baseRgb, lerpRgb, lerpStr);
-  }
-
-  // Bloom writer — paired with bloom-ripple. Always lerps revealed
-  // chars from revealRgb (static gray) toward wakeRgb (ripple peak).
-  // Unrevealed chars are handled inside colorAndGlowBloom (cover state,
-  // no inline style).
-  function bloomColorWriter(c, x) {
-    Renderer.colorAndGlowBloom(c, x.revealRgb, x.wakeRgb, x.wakeStr);
-  }
-
-  // Burn writer — paired with burn. Two hot states precede the
-  // bloom-ripple contract:
-  //   unburned, heat > 0  → cover→ember ramp by heat (the brightening
-  //                          edge; writeLitColor gives the same gamma +
-  //                          glow curve as every other lit path)
-  //   burned, cooling     → white-hot ember flash decaying to
-  //                          revealColor over burnCoolMs
-  //   burned, settled     → Renderer.colorAndGlowBloom — identical
-  //                          styling to bloom-ripple (static gray at
-  //                          rest, ripple washes toward wakeColor)
-  function burnColorWriter(c, x) {
-    if (!c.revealed) {
-      if (c.burnHeat > 0.01) {
-        writeLitColor(c.el, c.burnHeat, x.baseRgb, x.emberRgb, x.emberStr);
-        c.wasLit = true;
-        c.colorPinned = true;
-      } else if (c.wasLit || c.colorPinned) {
-        // Cooled back to cover — drop inline styles so CSS color shows.
-        c.el.style.color = '';
-        c.el.style.textShadow = '';
-        c.wasLit = false;
-        c.colorPinned = false;
-      }
-      return;
-    }
-    const age = x.time - c.burnedAt;
-    if (age < x.opts.burnCoolMs) {
-      // Leaving c.wasLit set hands off cleanly below: colorAndGlowBloom's
-      // wasLit branch settles the char to the static revealRgb.
-      writeLitColor(c.el, 1 - age / x.opts.burnCoolMs, x.revealRgb, x.emberHotRgb, x.emberStr);
-      c.wasLit = true;
-      c.colorPinned = true;
-      return;
-    }
-    Renderer.colorAndGlowBloom(c, x.revealRgb, x.wakeRgb, x.wakeStr);
-  }
-
-  // Per-mode resting-glyph resolvers — which char textEl settles on when
-  // not actively scrambling. The default shows the lower layer only for
-  // revealed chars; burn INVERTS the relationship (the procedural mask
-  // covers unrevealed chars, the element's own char is the payload).
-  function defaultNaturalGlyph(c) {
-    return c.revealed && c.revealChar != null ? c.revealChar : c.originalChar;
-  }
-  function burnNaturalGlyph(c) {
-    return c.revealed ? c.originalChar : (c.maskGlyph || c.originalChar);
-  }
-
-  // Per-mode scramble gates. Burn must suppress effect-driven scramble
-  // on masked chars: pickers derive from c.originalChar, so a wavefront
-  // case-flip would flash the hidden payload through the mask.
-  function scrambleAlways() { return true; }
-  function scrambleRevealedOnly(c) { return c.revealed; }
-
-  const REVEAL_MODES = {
-    'cursor':       { frame: RevealLayer.frame, colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
-    'wave':         { frame: WaveReveal.frame,  colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
-    'bloom-ripple': { frame: BloomRipple.frame, colorWriter: bloomColorWriter,   naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
-    'burn':         { frame: BurnReveal.frame,  colorWriter: burnColorWriter,    naturalGlyph: burnNaturalGlyph,    scrambleOk: scrambleRevealedOnly },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
-  //  DEFAULTS — every option is a knob exposed to the user.
-  // ════════════════════════════════════════════════════════════════════
-
-  const DEFAULTS = {
-    // Effect & shape
-    effect:      'repel',
-    radius:      160,           // px — proximity falloff radius (most effects)
-    strength:    30,            // effect-specific magnitude
-    falloff:     'gaussian',    // see Falloffs registry
-    // Spring (transform channel)
-    spring:      0.18,          // 0..1 — stiffness toward target
-    damping:     0.72,          // 0..1 — velocity decay per frame
-    // Brightness (asymmetric lerp)
-    wakeAttack:  0.55,          // 0..1 — rise rate when target > current
-    wakeDecay:   0.12,          // 0..1 — fall rate when target < current (lower = longer trail)
-    wakeColor:   '#ffffff',     // CSS color — destination of the brightness lerp
-    // Glyph swap
-    swapMode:    'caseFlip',    // see GlyphPickers registry
-    swapInterval: 70,           // ms between per-char re-rolls while scrambling
-    glyphPool:   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*+=<>?/',
-    swapSymbols: '!@#$%^&*+=<>?/|~',
-    // Ripple physics — physical constants live in the Ripple subsystem;
-    // these keys mirror them under prefixed names for the flat options bag.
-    rippleSpeed:        Ripple.DEFAULTS.speed,    // px/ms — wavefront expansion rate
-    rippleSpatialAtten: Ripple.DEFAULTS.spatial,  // px — wave amplitude is 1/e at this distance
-    ripplePostHit:      Ripple.DEFAULTS.postHit,  // ms — exp decay after wavefront passes
-    rippleEdge:         Ripple.DEFAULTS.edge,     // px — width of the swap band at the wavefront
-    // Reveal layer — independent of effect. All three modes are word-level
-    // (see WordReveal banner): touching any char activates its whole
-    // word and the word blooms outward letter-by-letter from the
-    // cursor-closest anchor. Settings:
-    //   'cursor' (default) — sticky proximity reveal (RevealLayer)
-    //   'wave'             — reversible wave-driven (WaveReveal)
-    //   'bloom-ripple'     — sticky wave-driven bloom; pair with
-    //                        effect: 'ripple' to stylize revealed words
-    //                        (BloomRipple + Renderer.colorAndGlowBloom)
-    //   'burn'             — paper-burn reveal of the element's OWN text
-    //                        from under a twinkling procedural mask
-    //                        (BurnReveal; char-level, ignores revealText;
-    //                        pair with effect: 'ripple' for the styling)
-    //   any other value    — none runs (still allows revealText to be set
-    //                        without effect, e.g., for plugin-driven reveal)
-    revealMode:      'cursor',
-    revealText:      '',        // lower-layer string (1:1 to upper's visible chars); '' disables the feature
-    revealColor:     '',        // CSS color the revealed glyph is pinned to; '' falls back to wakeColor
-    revealRadius:     60,       // px — chars within this distance of the cursor count as touched
-    revealHoldMs:     3000,     // ms — wave mode: how long a word stays active past its last touched frame
-    revealWordStepMs: 30,       // ms — per-char step for the outward bloom (and inverse-collapse) within a word
-    // Burn reveal — see BurnReveal module above. Active when revealMode:
-    // 'burn'. Physical constants are owned by BurnReveal.DEFAULTS and
-    // mirrored here under prefixed names (same pattern as ripple*).
-    burnRadius:       BurnReveal.DEFAULTS.radius,       // px — cursor ignition reach
-    burnRate:         BurnReveal.DEFAULTS.rate,         // heat/s at cursor center
-    burnSmolderRate:  BurnReveal.DEFAULTS.smolderRate,  // heat/s — self-burn + neighbor radiation scale
-    burnSmolderReach: BurnReveal.DEFAULTS.smolderReach, // px — radiation reach of a burning char
-    burnIgnite:       BurnReveal.DEFAULTS.ignite,       // 0..1 — kindling point; past it a char always completes
-    burnCoolMs:       BurnReveal.DEFAULTS.coolMs,       // ms — ember flash after combustion
-    burnEmberColor:   BurnReveal.DEFAULTS.emberColor,   // CSS color of the burning edge
-    burnTwinkleMs:    BurnReveal.DEFAULTS.twinkleMs,    // ms — mean mask re-roll interval
-    // Redact effect — see Redact module above. Active when effect: 'redact'.
-    // Visual is a CSS background bar painted on a per-char cover layer
-    // (see Splitter banner) — no glyph swap, so redaction is layout- and
-    // font-metric-neutral. The bar fills the original char's bounding box.
-    redactRadius:       80,     // px — inner radius A; chars within this are always redacted
-    redactFringe:       120,    // px — band width; outer radius B = A + this
-    redactTurnoverMs:   500,    // ms — period between morphing swaps (default 2/sec)
-    redactTurnoverFrac: 0.30,   // 0..1 — fraction of in-band redacted chars swapped per turn
-    redactColor:        '',     // CSS color for the redact bar; '' falls back to currentColor (inherits text color)
-    // Layout / DOM
-    splitWords:  true,          // wrap whole words in inline-block (prevents mid-word wrap)
-    remeasureOn: 'auto',        // 'auto' | 'manual'
-    className:   'tr-char',     // base class for char spans
-  };
-
-  // Frozen rest target — returned when a char has no active influence so
-  // the integrators have a known-zero state without per-char allocation.
-  const REST = Object.freeze({ tx: 0, ty: 0, rot: 0, scale: 1, brightness: 0, scramble: 0, interior: false });
-
-  // ════════════════════════════════════════════════════════════════════
-  //  TextRippling — public façade.
-  //
-  //  Constructor:  new TextRippling(elementOrSelector, options?)
-  //  Methods:      .update(opts), .remeasure(), .destroy()
-  // ════════════════════════════════════════════════════════════════════
-
-  class TextRippling {
-    constructor(element, options) {
-      if (typeof element === 'string') element = document.querySelector(element);
-      if (!element) throw new Error('TextRippling: element not found');
-
-      this.element = element;
-      this.options = Object.assign({}, DEFAULTS, options || {});
-      this._originalHTML = element.innerHTML;
-      this._chars = Splitter.split(element, this.options);
+  // The frame engine owns the state and policy of one animation pipeline.
+  // TextRippling remains the public DOM/lifecycle facade and passes its current
+  // options object into every call so replacing instance.options keeps working.
+  class FrameEngine {
+    constructor(element, chars, options) {
+      this._element = element;
+      this._chars = chars;
       this._baseColorRgb = null;
       this._wakeCache = null;
       this._revealCache = null;
       this._emberCache = null;
-      this._ro = null;
       this._springAccum = 0;
       this._redactNextTurn = 0;
       this._frameId = 0;
-      this._destroyed = false;
 
       this._captureBaseColor();
-      RevealLayer.attach(this._chars, this.options, element);
-      if (this.options.revealMode === 'burn') BurnReveal.attach(this._chars, this.options);
-      this._measure();
-      this._bind();
-
-      CursorField.attach();
-      AnimationLoop.add(this);
-
-      // Re-measure once webfonts have loaded — char metrics may shift.
-      // The instance may have been destroyed by then; guard accordingly.
-      if (document.fonts && document.fonts.ready) {
-        document.fonts.ready.then(() => {
-          if (!this._destroyed) this._measure();
-        });
-      }
+      FeatureLifecycle.attach(chars, options, element);
     }
 
-    update(options) {
-      // Snapshot prev opts so module onUpdate hooks can diff. Shallow
-      // clone is cheap (~25 keys) and avoids per-key stash-pairs that
-      // each new option would otherwise add to this method.
-      const prev = Object.assign({}, this.options);
-      Object.assign(this.options, options);
+    update(options, patch) {
+      // Snapshot previous values before mutating the facade's current options
+      // object. In particular, this must not retain the constructor's object.
+      const prev = Object.assign({}, options);
+      Object.assign(options, patch);
       this._wakeCache = null;
       this._revealCache = null;
       this._emberCache = null;
-      // Reveal-mode change: c.colorPinned and c.wasLit have different
-      // invariants per writer (defaultColorWriter treats colorPinned as
-      // "revealed-and-painted-with-revealColor"; bloomColorWriter treats
-      // it as "I've written some explicit color"). Swapping writers
-      // mid-life would leave the new writer reading the old writer's
-      // latch state — clear both so it starts from a known cover state.
-      if (prev.revealMode !== this.options.revealMode) {
-        for (const c of this._chars) { c.colorPinned = false; c.wasLit = false; }
-      }
-      // Per-module lifecycle fan-out. Each module owns its own
-      // diff/cleanup logic — adding a new module's update side effects
-      // means adding one onUpdate call here, not threading another
-      // prev/curr stash through the body.
-      RevealLayer.onUpdate(prev, this.options, this._chars, this.element);
-      BurnReveal.onUpdate(prev, this.options, this._chars);
-      Redact.onUpdate(prev, this.options, this._chars);
+
+      FeatureLifecycle.update(prev, options, this._chars, this._element);
     }
 
-    remeasure() {
-      this._measure();
-    }
-
-    destroy() {
-      this._destroyed = true;
-      AnimationLoop.remove(this);
-      if (this._ro) { this._ro.disconnect(); this._ro = null; }
-      this.element.innerHTML = this._originalHTML;
-      this._chars = [];
-    }
-
-    // ── internals ──────────────────────────────────────────────────────
-
-    // Capture the stylesheet-resolved text color from a sample char.
-    // Called once at construction, before any inline `color` is written,
-    // so the result reflects the user's CSS rather than a tinted rgb()
-    // value left over from a prior frame. No-op on empty elements.
-    _captureBaseColor() {
-      if (this._chars.length === 0) return;
-      const sample = this._chars[0].el;
-      const prev = sample.style.color;
-      sample.style.color = '';
-      this._baseColorRgb = Color.parse(getComputedStyle(sample).color);
-      sample.style.color = prev;
-    }
-
-    _measure() {
-      // Char centers are stored in PAGE space (client + scroll). This is
-      // the framework's canonical coord space — same as CursorField stamps
-      // and `ctx.mouseX/Y`. The payoff: scrolling alone doesn't move chars
-      // in page space, so no per-scroll remeasure is needed.
-      const sx = window.scrollX || window.pageXOffset || 0;
-      const sy = window.scrollY || window.pageYOffset || 0;
-      for (const c of this._chars) {
-        const prev = c.el.style.transform;
-        c.el.style.transform = '';
-        const r = c.el.getBoundingClientRect();
-        c.hx = r.left + sx + r.width / 2;
-        c.hy = r.top + sy + r.height / 2;
-        c.el.style.transform = prev;
-      }
-    }
-
-    _bind() {
-      if (this.options.remeasureOn !== 'auto') return;
-      if (typeof ResizeObserver !== 'undefined') {
-        this._ro = new ResizeObserver(() => this._measure());
-        this._ro.observe(this.element);
-      }
-      // No scroll listener: positions are page-space, so scrolling
-      // doesn't change them. ResizeObserver still catches layout shifts.
-    }
-
-    _tick(now, dt) {
-      const opts = this.options;
-      const effect  = resolve(Effects,      opts.effect,   Effects.repel);
-      const falloff = resolve(Falloffs,     opts.falloff,  Falloffs.gaussian);
-      const picker  = resolve(GlyphPickers, opts.swapMode, GlyphPickers.pool);
+    tick(now, dt, options) {
+      // Registries are public and mutable, so resolve every strategy each tick.
+      const effect  = resolve(Effects,      options.effect,   Effects.repel);
+      const falloff = resolve(Falloffs,     options.falloff,  Falloffs.gaussian);
+      const picker  = resolve(GlyphPickers, options.swapMode, GlyphPickers.pool);
 
       if (!this._wakeCache) {
-        const w = Color.parse(opts.wakeColor);
+        const w = Color.parse(options.wakeColor);
         this._wakeCache = { rgb: w, str: `${w[0]},${w[1]},${w[2]}` };
       }
-      // Lazy-parse revealColor only when set; otherwise reveal lerps
-      // toward wakeColor too (brightness multiplier still differentiates).
-      if (!this._revealCache && opts.revealColor) {
-        const r = Color.parse(opts.revealColor);
+      // Lazy-parse revealColor only when set; otherwise reveal lerps toward
+      // wakeColor too (brightness still differentiates the endpoints).
+      if (!this._revealCache && options.revealColor) {
+        const r = Color.parse(options.revealColor);
         this._revealCache = { rgb: r, str: `${r[0]},${r[1]},${r[2]}` };
       }
-      // Ember endpoints for burn mode — parsed once like the other color
-      // caches. `hot` is the combustion-flash color (ember pushed toward
-      // white); the cooling ramp decays from it back to revealColor.
       if (!this._emberCache) {
-        const e = Color.parse(opts.burnEmberColor);
+        const e = Color.parse(options.burnEmberColor);
         this._emberCache = {
           rgb: e,
           str: `${e[0]},${e[1]},${e[2]}`,
@@ -1930,13 +1757,10 @@
 
       const ctx = makeContext(now, dt);
       ctx.frameId = ++this._frameId;
-      const r = opts.radius;
+      const r = options.radius;
       const rCutoffSq = (r * 2) * (r * 2);
       const isGlobal = effect.global === true;
 
-      // Spring substep accumulator — pay one integration step per
-      // REF_DT_MS regardless of refresh rate. Brightness lerp uses an
-      // exact closed-form dt step instead, so it doesn't need this.
       this._springAccum += dt;
       let springSteps = 0;
       while (this._springAccum >= REF_DT_MS) {
@@ -1944,32 +1768,18 @@
         springSteps++;
       }
 
-      // Redact effect — fire the morphing turnover at most once per
-      // redactTurnoverMs. The per-char zone classification + state
-      // seeding happens inside the per-char loop below.
-      const isRedact = opts.effect === 'redact';
+      const isRedact = options.effect === 'redact';
       if (isRedact && now >= this._redactNextTurn) {
-        Redact.turnover(this._chars, opts);
-        this._redactNextTurn = now + opts.redactTurnoverMs;
+        Redact.turnover(this._chars, options);
+        this._redactNextTurn = now + options.redactTurnoverMs;
       }
 
-      // Reveal: look up the mode bundle (frame, colorWriter, naturalGlyph,
-      // scrambleOk). The frame runs once per tick and sets c.revealed for
-      // every char; the other three are consulted per char inside the
-      // loop below. Unknown mode → no frame runs and the default writer/
-      // resolver/gate are used (this is how an effect-only instance with
-      // no reveal feature works — leave revealText empty so applyChar
-      // wouldn't latch anything anyway, and the writer's revealed
-      // branches stay dormant).
-      const modeBundle = REVEAL_MODES[opts.revealMode];
-      if (modeBundle) modeBundle.frame(this._chars, ctx, opts);
+      const modeBundle = REVEAL_MODES[options.revealMode];
+      if (modeBundle) modeBundle.frame(this._chars, ctx, options);
       const colorWriter = modeBundle ? modeBundle.colorWriter  : defaultColorWriter;
       const naturalOf   = modeBundle ? modeBundle.naturalGlyph : defaultNaturalGlyph;
       const scrambleOk  = modeBundle ? modeBundle.scrambleOk   : scrambleAlways;
 
-      // Per-frame color context — resolve endpoints once so the per-char
-      // writer doesn't have to re-check this._revealCache for every glyph.
-      // revealRgb/Str fall back to wakeRgb/Str when revealColor is unset.
       const colorCtx = {
         baseRgb,
         wakeRgb,
@@ -1980,84 +1790,68 @@
         emberStr:    this._emberCache.str,
         emberHotRgb: this._emberCache.hot,
         time: now,
-        opts,
+        opts: options,
       };
 
       for (const c of this._chars) {
-        const target = evalCharTarget(c, ctx, effect, falloff, opts, isGlobal, rCutoffSq);
+        const target = evalCharTarget(c, ctx, effect, falloff, options, isGlobal, rCutoffSq);
 
         Char.springStep(c, target.tx || 0, target.ty || 0, target.rot || 0,
                         typeof target.scale === 'number' ? target.scale : 1,
-                        opts.spring, opts.damping, springSteps);
-        Char.brightnessLerp(c, target.brightness || 0, opts.wakeAttack, opts.wakeDecay, dt);
+                        options.spring, options.damping, springSteps);
+        Char.brightnessLerp(
+          c,
+          target.brightness || 0,
+          options.wakeAttack,
+          options.wakeDecay,
+          dt,
+        );
 
-        // Redact: per-char zone classification + state seeding. Boolean
-        // state otherwise owned by the periodic turnover above. The
-        // bottom text layer is never modified — Renderer.cover paints
-        // the redaction bar on a separate absolutely-positioned layer,
-        // so the original glyph keeps owning the slot's layout box.
-        if (isRedact) Redact.tick(c, ctx, opts);
+        if (isRedact) Redact.tick(c, ctx, options);
 
-        // Suppress scramble while redacted so the (covered) glyph
-        // underneath doesn't churn — the bar is opaque so it wouldn't
-        // be visible anyway, but skipping the swap avoids needless DOM
-        // writes and keeps the underlying char ready to re-emerge as
-        // its original self the moment the cover lifts. The mode's
-        // scramble gate can veto too (burn: masked chars must never
-        // case-flip, which would leak the hidden payload).
-        const scrambleTarget = (c.redacted || !scrambleOk(c)) ? 0 : (target.scramble || 0);
-        const naturalGlyph   = naturalOf(c);
+        const scrambleTarget = (c.redacted || !scrambleOk(c))
+          ? 0
+          : (target.scramble || 0);
+        const naturalGlyph = naturalOf(c);
 
+        // Render order is part of the frame contract.
         Renderer.transform(c);
         colorWriter(c, colorCtx);
-        Renderer.glyph(c, scrambleTarget, now, opts, picker, naturalGlyph);
+        Renderer.glyph(c, scrambleTarget, now, options, picker, naturalGlyph);
         Renderer.cover(c);
       }
     }
+
+    release() {
+      this._chars = [];
+      this._element = null;
+    }
+
+    _captureBaseColor() {
+      if (this._chars.length === 0) return;
+      const sample = this._chars[0].el;
+      const prev = sample.style.color;
+      sample.style.color = '';
+      this._baseColorRgb = Color.parse(getComputedStyle(sample).color);
+      sample.style.color = prev;
+    }
   }
 
-  // ════════════════════════════════════════════════════════════════════
-  //  Tick helpers — kept outside the class so the hot loop stays readable.
-  // ════════════════════════════════════════════════════════════════════
-
   function makeContext(now, dt) {
-    // Convert the cursor sample (client-space, as the browser delivers it)
-    // into page space here so every effect sees a single coord convention
-    // — same space as `c.hx/hy` and `CursorField.stamps`. mouseVx/Vy stay
-    // as client-space deltas: that's the rate at which the user is moving
-    // the mouse, independent of scroll, which is what effects expect.
-    const sx = window.scrollX || window.pageXOffset || 0;
-    const sy = window.scrollY || window.pageYOffset || 0;
     return {
-      mouseX:  CursorField.state.x + sx,
-      mouseY:  CursorField.state.y + sy,
+      mouseX:  clientToPageX(CursorField.state.x),
+      mouseY:  clientToPageY(CursorField.state.y),
       mouseVx: CursorField.state.vx,
       mouseVy: CursorField.state.vy,
       time:    now,
-      // Frame delta (ms) for modules that integrate per-frame rates
-      // (BurnReveal's heat field). Effects get their dt-correction via
-      // the spring accumulator / brightness lerp instead.
-      dt:      dt,
-      stamps:  CursorField.state.stamps,
-      // Per-frame instance counter. wordWaveFrame stamps it onto each
-      // char's Ripple memo; Effects.ripple compares to know if the
-      // stash is from this frame or stale. Set by _tick.
+      dt,
+      stamps: CursorField.state.stamps,
       frameId: 0,
-      // Per-char scratch fields, mutated by evalCharTarget before each
-      // effect call so effects can reach back to the char without
-      // changing their (dx, dy, dist, f, opts, ctx) signature.
       charX: 0, charY: 0, charSeed: 0, char: null,
     };
   }
 
-  // Evaluate one char's effect target. Short-circuits when the char is
-  // out of cursor reach (and the effect isn't `global`), returning REST
-  // so the integrators advance toward zero without a per-char alloc.
-  //
-  // SIDE EFFECT: writes ctx.charX/charY/charSeed before calling the
-  // effect. This is how per-char data reaches effects without re-allocating
-  // ctx per char per frame; treat ctx as scratch space owned by the loop.
-  function evalCharTarget(c, ctx, effect, falloff, opts, isGlobal, rCutoffSq) {
+  function evalCharTarget(c, ctx, effect, falloff, options, isGlobal, rCutoffSq) {
     const dx = c.hx - ctx.mouseX;
     const dy = c.hy - ctx.mouseY;
     const d2 = dx * dx + dy * dy;
@@ -2067,7 +1861,7 @@
     const dist = Math.sqrt(d2);
     let f = 0;
     if (!isGlobal) {
-      f = falloff(dist, opts.radius);
+      f = falloff(dist, options.radius);
       if (f < 0) f = 0; else if (f > 1) f = 1;
       if (f < 0.001) return REST;
     }
@@ -2076,81 +1870,185 @@
     ctx.charY = c.hy;
     ctx.charSeed = c.seed;
     ctx.char = c;
-    return effect(dx, dy, dist, f, opts, ctx) || REST;
+    return effect(dx, dy, dist, f, options, ctx) || REST;
   }
 
-  // Look up a strategy by name in a registry. Functions pass through so
-  // callers can hand in a custom strategy without registering it; unknown
-  // names fall back to the registry's documented default.
   function resolve(registry, name, fallback) {
     return typeof name === 'function' ? name : (registry[name] || fallback);
   }
 
-  // ════════════════════════════════════════════════════════════════════
-  //  Convenience + exports
-  // ════════════════════════════════════════════════════════════════════
+  // Reveal mode policy belongs beside the frame dispatch that consumes it.
+  function defaultColorWriter(c, x) {
+    const showLower = c.revealed && c.revealChar != null;
+    const lerpRgb = showLower ? x.revealRgb : x.wakeRgb;
+    const lerpStr = showLower ? x.revealStr : x.wakeStr;
+    Renderer.colorAndGlow(c, x.baseRgb, lerpRgb, lerpStr);
+  }
+
+  function bloomColorWriter(c, x) {
+    Renderer.colorAndGlowBloom(c, x.revealRgb, x.wakeRgb, x.wakeStr);
+  }
+
+  function burnColorWriter(c, x) {
+    if (!c.revealed) {
+      if (c.burnHeat > 0.01) {
+        writeLitColor(c.el, c.burnHeat, x.baseRgb, x.emberRgb, x.emberStr);
+        c.wasLit = true;
+        c.colorPinned = true;
+      } else if (c.wasLit || c.colorPinned) {
+        c.el.style.color = '';
+        c.el.style.textShadow = '';
+        c.wasLit = false;
+        c.colorPinned = false;
+      }
+      return;
+    }
+    const age = x.time - c.burnedAt;
+    if (age < x.opts.burnCoolMs) {
+      writeLitColor(
+        c.el,
+        1 - age / x.opts.burnCoolMs,
+        x.revealRgb,
+        x.emberHotRgb,
+        x.emberStr,
+      );
+      c.wasLit = true;
+      c.colorPinned = true;
+      return;
+    }
+    Renderer.colorAndGlowBloom(c, x.revealRgb, x.wakeRgb, x.wakeStr);
+  }
+
+  function defaultNaturalGlyph(c) {
+    return c.revealed && c.revealChar != null ? c.revealChar : c.originalChar;
+  }
+
+  function burnNaturalGlyph(c) {
+    return c.revealed ? c.originalChar : (c.maskGlyph || c.originalChar);
+  }
+
+  function scrambleAlways() { return true; }
+  function scrambleRevealedOnly(c) { return c.revealed; }
+
+  const REVEAL_MODES = {
+    'cursor':       { frame: RevealLayer.frame, colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
+    'wave':         { frame: WaveReveal.frame,  colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
+    'bloom-ripple': { frame: BloomRipple.frame, colorWriter: bloomColorWriter,   naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
+    'burn':         { frame: BurnReveal.frame,  colorWriter: burnColorWriter,    naturalGlyph: burnNaturalGlyph,    scrambleOk: scrambleRevealedOnly },
+  };
+
+  // Public facade. It owns DOM setup, measurement, scheduling, and restoration;
+  // FrameEngine owns the frame pipeline behind the _tick/update adapters.
+  class TextRippling {
+    constructor(element, options) {
+      if (typeof element === 'string') element = document.querySelector(element);
+      if (!element) throw new Error('TextRippling: element not found');
+
+      this.element = element;
+      this.options = Object.assign({}, DEFAULTS, options || {});
+      this._originalHTML = element.innerHTML;
+      this._chars = Splitter.split(element, this.options);
+      this._ro = null;
+      this._destroyed = false;
+      this._engine = new FrameEngine(element, this._chars, this.options);
+
+      this._measure();
+      this._bind();
+
+      CursorField.attach();
+      AnimationLoop.add(this);
+
+      // Re-measure once webfonts have loaded. The instance may have been
+      // destroyed by then, so keep the existing guard.
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(() => {
+          if (!this._destroyed) this._measure();
+        });
+      }
+    }
+
+    update(options) {
+      this._engine.update(this.options, options);
+    }
+
+    remeasure() {
+      this._measure();
+    }
+
+    destroy() {
+      this._destroyed = true;
+      AnimationLoop.remove(this);
+      if (this._ro) { this._ro.disconnect(); this._ro = null; }
+      this._engine.release();
+      this.element.innerHTML = this._originalHTML;
+      this._chars = [];
+    }
+
+    // Char centers live in page space, matching cursor stamps and frame context.
+    _measure() {
+      const sx = clientToPageX(0);
+      const sy = clientToPageY(0);
+      for (const c of this._chars) {
+        const prev = c.el.style.transform;
+        c.el.style.transform = '';
+        const r = c.el.getBoundingClientRect();
+        c.hx = r.left + sx + r.width / 2;
+        c.hy = r.top + sy + r.height / 2;
+        c.el.style.transform = prev;
+      }
+    }
+
+    _bind() {
+      if (this.options.remeasureOn !== 'auto') return;
+      if (typeof ResizeObserver !== 'undefined') {
+        this._ro = new ResizeObserver(() => this._measure());
+        this._ro.observe(this.element);
+      }
+    }
+
+    _tick(now, dt) {
+      this._engine.tick(now, dt, this.options);
+    }
+  }
 
   function rippleAll(selector, options) {
     return Array.from(document.querySelectorAll(selector))
       .map((el) => new TextRippling(el, options));
   }
 
-  // Attach registries and helpers to the constructor for plugin authors.
-  TextRippling.version      = VERSION;
-  TextRippling.effects      = Effects;
-  TextRippling.falloffs     = Falloffs;
-  TextRippling.glyphPickers = GlyphPickers;
-  TextRippling.rippleAll    = rippleAll;
-  // Cursor field is exposed for advanced use: custom effects can read
-  // history (cursor.state.stamps), and tests / alternative input sources
-  // can push state.x/y and call cursor.update(now) directly.
-  TextRippling.cursor       = CursorField;
-  // Ripple physics module is exposed so it can be used standalone — pass
-  // any (charX, charY, time, stamps[, ...]) and get back wake amplitude,
-  // independent of the rest of the framework.
-  TextRippling.ripple       = Ripple;
-  // WordReveal is the shared word-level activation/animation orchestrator
-  // used by both reveal modes. Plugin authors can call its helpers
-  // directly to drive custom reveal behavior on the per-word state
-  // (c.wordState) that Splitter populates.
-  TextRippling.wordReveal   = WordReveal;
-  // RevealLayer is exposed for plugin authors that want to drive layer
-  // assignment manually (skipping `revealText` / `data-reveal`) by
-  // writing `c.revealChar` directly. Public API: .frame(chars, ctx, opts).
-  TextRippling.revealLayer  = RevealLayer;
-  // WaveReveal is exposed similarly — public API: .frame(chars, ctx, opts)
-  // for the wave-driven reversible reveal mode.
-  TextRippling.waveReveal   = WaveReveal;
-  // BloomRipple — public API: .frame(chars, ctx, opts) for the wave-driven
-  // sticky bloom that pairs with effect: 'ripple' for styled revealed text.
-  TextRippling.bloomRipple  = BloomRipple;
-  // BurnReveal — public API: .frame(chars, ctx, opts) for the paper-burn
-  // reveal ('burn' mode); .attach(chars, opts) re-masks and resets the
-  // burn state (a fresh sheet of paper).
-  TextRippling.burnReveal   = BurnReveal;
-  // Redact is exposed for plugin authors that want to drive the
-  // stochastic block redaction directly (skip Effects.redact dispatch).
-  TextRippling.redact       = Redact;
+  // This object is the single source of truth for constructor attachments,
+  // CommonJS properties, and generated ESM named exports. Key order is part
+  // of the established CommonJS constructor shape and must remain stable.
+  const PUBLIC_API = {
+    version: VERSION,
+    effects: Effects,
+    falloffs: Falloffs,
+    glyphPickers: GlyphPickers,
+    rippleAll,
+    cursor: CursorField,
+    ripple: Ripple,
+    wordReveal: WordReveal,
+    revealLayer: RevealLayer,
+    waveReveal: WaveReveal,
+    bloomRipple: BloomRipple,
+    burnReveal: BurnReveal,
+    redact: Redact,
+  };
+
+  Object.assign(TextRippling, PUBLIC_API);
+
+  const root = typeof window !== 'undefined' ? window : globalThis;
 
   // Browser global (works under <script src> from file:// or http://).
   if (typeof root !== 'undefined') root.TextRippling = TextRippling;
 
-  // CommonJS (Node, bundlers).
+  // CommonJS (Node, bundlers). Assigning PUBLIC_API after TextRippling keeps
+  // module.exports.TextRippling identical to the constructor while retaining
+  // the constructor's established static-property insertion order.
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = TextRippling;
-    module.exports.TextRippling  = TextRippling;
-    module.exports.rippleAll     = rippleAll;
-    module.exports.effects       = Effects;
-    module.exports.falloffs      = Falloffs;
-    module.exports.glyphPickers  = GlyphPickers;
-    module.exports.cursor        = CursorField;
-    module.exports.ripple        = Ripple;
-    module.exports.wordReveal    = WordReveal;
-    module.exports.revealLayer   = RevealLayer;
-    module.exports.waveReveal    = WaveReveal;
-    module.exports.bloomRipple   = BloomRipple;
-    module.exports.burnReveal    = BurnReveal;
-    module.exports.redact        = Redact;
-    module.exports.version       = VERSION;
+    module.exports.TextRippling = TextRippling;
+    Object.assign(module.exports, PUBLIC_API);
   }
-}(typeof window !== 'undefined' ? window : globalThis));
+
+})();

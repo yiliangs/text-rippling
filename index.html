@@ -195,60 +195,6 @@
   </footer>
 
   <script src="./src/text-rippling.js"></script>
-  <script>
-    // Wire any element with data-effect to a TextRippling instance,
-    // reading parameters from data-* attributes.
-    const instances = new Map();
-    for (const el of document.querySelectorAll('[data-effect]')) {
-      const opts = {
-        effect: el.dataset.effect || 'repel',
-        radius: +el.dataset.radius || 160,
-        strength: +el.dataset.strength || 30,
-        falloff: el.dataset.falloff || 'gaussian',
-      };
-      // Optional reveal-layer knobs — only set when the attribute is present
-      // so unspecified instances stay on the library defaults.
-      if (el.dataset.revealMode)   opts.revealMode   = el.dataset.revealMode;
-      if (el.dataset.revealColor)  opts.revealColor  = el.dataset.revealColor;
-      if (el.dataset.revealRadius) opts.revealRadius = +el.dataset.revealRadius;
-      if (el.dataset.revealFringe) opts.revealFringe = +el.dataset.revealFringe;
-      if (el.dataset.revealHoldMs) opts.revealHoldMs = +el.dataset.revealHoldMs;
-      // Redact knobs — same pattern.
-      if (el.dataset.redactRadius)       opts.redactRadius       = +el.dataset.redactRadius;
-      if (el.dataset.redactFringe)       opts.redactFringe       = +el.dataset.redactFringe;
-      if (el.dataset.redactTurnoverMs)   opts.redactTurnoverMs   = +el.dataset.redactTurnoverMs;
-      if (el.dataset.redactTurnoverFrac) opts.redactTurnoverFrac = +el.dataset.redactTurnoverFrac;
-      if (el.dataset.redactColor)        opts.redactColor        = el.dataset.redactColor;
-      // Burn knobs — same pattern.
-      if (el.dataset.burnRadius)       opts.burnRadius       = +el.dataset.burnRadius;
-      if (el.dataset.burnRate)         opts.burnRate         = +el.dataset.burnRate;
-      if (el.dataset.burnSmolderRate)  opts.burnSmolderRate  = +el.dataset.burnSmolderRate;
-      if (el.dataset.burnSmolderReach) opts.burnSmolderReach = +el.dataset.burnSmolderReach;
-      if (el.dataset.burnCoolMs)       opts.burnCoolMs       = +el.dataset.burnCoolMs;
-      if (el.dataset.burnEmberColor)   opts.burnEmberColor   = el.dataset.burnEmberColor;
-      if (el.dataset.burnTwinkleMs)    opts.burnTwinkleMs    = +el.dataset.burnTwinkleMs;
-      instances.set(el, new TextRippling(el, opts));
-    }
-
-    // Playground controls.
-    const pg = instances.get(document.getElementById('playground'));
-    const bind = (id, key, transform = (v) => v) => {
-      const input = document.getElementById('ctrl-' + id);
-      const out = document.getElementById('out-' + id);
-      const apply = () => {
-        const v = transform(input.value);
-        pg.update({ [key]: v });
-        if (out) out.textContent = typeof v === 'number' ? (v % 1 ? v.toFixed(2) : v) : v;
-      };
-      input.addEventListener('input', apply);
-      input.addEventListener('change', apply);
-    };
-    bind('effect', 'effect');
-    bind('falloff', 'falloff');
-    bind('radius', 'radius', (v) => +v);
-    bind('strength', 'strength', (v) => +v);
-    bind('spring', 'spring', (v) => +v);
-    bind('damping', 'damping', (v) => +v);
-  </script>
+  <script src="./demo.js"></script>
 </body>
 </html>
