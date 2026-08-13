@@ -382,7 +382,7 @@ const WaveReveal = {
 //    Phase 2 (Effects.ripple, set by user as `effect: 'ripple'`): the
 //    ordinary ripple physics drives c.bright per char from the wave
 //    amplitude history. Renderer.colorAndGlowBloom (paired with this
-//    mode via REVEAL_MODES) then lerps revealed chars from `revealColor`
+//    mode by FrameEngine) then lerps revealed chars from `revealColor`
 //    (static gray) toward `wakeColor` (ripple peak white). Unrevealed
 //    chars stay at the CSS cover color and ignore c.bright entirely.
 //

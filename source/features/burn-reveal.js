@@ -35,7 +35,7 @@
 //  3. BLOOM-RIPPLE ADOPTION — burned chars join the bloom-ripple
 //     color contract (static `revealColor` at rest, lerped toward
 //     `wakeColor` by ripple brightness — pair with effect: 'ripple').
-//     The dedicated writer (burnColorWriter below) prepends two hot
+//     FrameEngine's dedicated burn writer prepends two hot
 //     states: cover→ember by heat while burning, then an ember→
 //     revealColor cooling flash over `burnCoolMs` right after
 //     combustion. Chars still cooling also keep radiating, which is

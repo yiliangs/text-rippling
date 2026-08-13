@@ -440,3 +440,222 @@ test('manual _tick crosses the effect, spring, transform, and color render seam'
     rippling.destroy();
   }
 });
+
+test('the facade keeps its surface and delegates _tick with the current options object', () => {
+  const element = host('A');
+  const rippling = new TextRippling(element, {
+    effect: 'none',
+    revealMode: 'none',
+    remeasureOn: 'manual',
+  });
+  const calls = [];
+  rippling._engine.tick = (...args) => calls.push(args);
+
+  try {
+    rippling._tick(123, 4.5);
+
+    assert.equal(rippling.element, element);
+    assert.ok(Array.isArray(rippling._chars));
+    assert.equal(typeof rippling.update, 'function');
+    assert.equal(typeof rippling.remeasure, 'function');
+    assert.equal(typeof rippling.destroy, 'function');
+    assert.deepEqual(rippling._engine._baseColorRgb, [10, 20, 30]);
+    assert.deepEqual(calls, [[123, 4.5, rippling.options]]);
+  } finally {
+    rippling.destroy();
+  }
+});
+
+test('update preserves accumulated spring time and monotonic frame epochs', () => {
+  const frameIds = [];
+  const effect = (dx, dy, dist, falloff, options, context) => {
+    frameIds.push(context.frameId);
+    return { tx: 5 };
+  };
+  effect.global = true;
+
+  const rippling = new TextRippling(host('A'), {
+    damping: 1,
+    effect,
+    revealMode: 'none',
+    remeasureOn: 'manual',
+    spring: 1,
+  });
+
+  try {
+    rippling._tick(10, 10);
+    assert.equal(rippling._chars[0].tx, 0);
+    assert.equal(rippling._engine._springAccum, 10);
+    assert.equal(rippling._engine._frameId, 1);
+
+    rippling.update({ radius: 111 });
+    assert.equal(rippling._engine._springAccum, 10);
+    assert.equal(rippling._engine._frameId, 1);
+
+    rippling._tick(20, 7);
+    assert.equal(rippling._chars[0].tx, 5);
+    assert.ok(Math.abs(rippling._engine._springAccum - 0.33) < 1e-12);
+    assert.equal(rippling._engine._frameId, 2);
+    assert.deepEqual(frameIds, [1, 2]);
+  } finally {
+    rippling.destroy();
+  }
+});
+
+test('update invalidates every parsed color cache before the next frame', () => {
+  const effect = () => ({ brightness: 1 });
+  effect.global = true;
+  const rippling = new TextRippling(host('A'), {
+    burnEmberColor: '#010203',
+    effect,
+    revealColor: '#040506',
+    revealMode: 'none',
+    remeasureOn: 'manual',
+    wakeAttack: 1,
+    wakeColor: '#070809',
+  });
+
+  try {
+    rippling._tick(10, 16.67);
+    assert.deepEqual(rippling._engine._wakeCache.rgb, [7, 8, 9]);
+    assert.deepEqual(rippling._engine._revealCache.rgb, [4, 5, 6]);
+    assert.deepEqual(rippling._engine._emberCache.rgb, [1, 2, 3]);
+
+    rippling.update({
+      burnEmberColor: '#111213',
+      revealColor: '#141516',
+      wakeColor: '#171819',
+    });
+    assert.equal(rippling._engine._wakeCache, null);
+    assert.equal(rippling._engine._revealCache, null);
+    assert.equal(rippling._engine._emberCache, null);
+
+    rippling._tick(20, 0);
+    assert.deepEqual(rippling._engine._wakeCache.rgb, [23, 24, 25]);
+    assert.deepEqual(rippling._engine._revealCache.rgb, [20, 21, 22]);
+    assert.deepEqual(rippling._engine._emberCache.rgb, [17, 18, 19]);
+    assert.equal(rippling._chars[0].el.style.color, 'rgb(23,24,25)');
+  } finally {
+    rippling.destroy();
+  }
+});
+
+test('effect, falloff, and glyph registries are resolved again on every tick', () => {
+  const registryKey = '__frame_engine_mutable_registry_test__';
+  const calls = [];
+  const installStrategies = (label, glyph) => {
+    TextRippling.effects[registryKey] = () => {
+      calls.push(`effect:${label}`);
+      return { scramble: 1 };
+    };
+    TextRippling.falloffs[registryKey] = () => {
+      calls.push(`falloff:${label}`);
+      return 1;
+    };
+    TextRippling.glyphPickers[registryKey] = () => {
+      calls.push(`picker:${label}`);
+      return glyph;
+    };
+  };
+
+  installStrategies('first', 'X');
+  const rippling = new TextRippling(host('A'), {
+    effect: registryKey,
+    falloff: registryKey,
+    radius: 100,
+    revealMode: 'none',
+    remeasureOn: 'manual',
+    swapInterval: 0,
+    swapMode: registryKey,
+  });
+  TextRippling.cursor.state.x = rippling._chars[0].hx;
+  TextRippling.cursor.state.y = rippling._chars[0].hy;
+
+  try {
+    rippling._tick(10, 0);
+    installStrategies('second', 'Y');
+    rippling._tick(20, 0);
+
+    assert.deepEqual(calls, [
+      'falloff:first', 'effect:first', 'picker:first',
+      'falloff:second', 'effect:second', 'picker:second',
+    ]);
+    assert.equal(rippling._chars[0].textEl.textContent, 'Y');
+  } finally {
+    delete TextRippling.effects[registryKey];
+    delete TextRippling.falloffs[registryKey];
+    delete TextRippling.glyphPickers[registryKey];
+    rippling.destroy();
+  }
+});
+
+test('reassigning options remains compatible with update and frame execution', () => {
+  const seenOptions = [];
+  const effect = (dx, dy, dist, falloff, options) => {
+    seenOptions.push(options);
+    return {};
+  };
+  effect.global = true;
+  const rippling = new TextRippling(host('A'), {
+    effect: 'none',
+    revealMode: 'none',
+    remeasureOn: 'manual',
+  });
+  const initialOptions = rippling.options;
+  const replacement = { ...initialOptions, effect, radius: 50 };
+
+  try {
+    rippling.options = replacement;
+    rippling.update({ radius: 75, wakeColor: '#abcdef' });
+    rippling._tick(10, 0);
+
+    assert.equal(rippling.options, replacement);
+    assert.equal(replacement.radius, 75);
+    assert.equal(replacement.wakeColor, '#abcdef');
+    assert.equal(initialOptions.radius, 160);
+    assert.deepEqual(seenOptions, [replacement]);
+  } finally {
+    rippling.destroy();
+  }
+});
+
+test('update retains explicit feature-hook order and destroy releases engine DOM refs', () => {
+  const modules = [
+    ['reveal', TextRippling.revealLayer],
+    ['burn', TextRippling.burnReveal],
+    ['redact', TextRippling.redact],
+  ];
+  const originals = modules.map(([, module]) => module.onUpdate);
+  const order = [];
+  for (let i = 0; i < modules.length; i++) {
+    const [name, module] = modules[i];
+    const original = originals[i];
+    module.onUpdate = (...args) => {
+      order.push(name);
+      return original(...args);
+    };
+  }
+
+  const rippling = new TextRippling(host('A'), {
+    effect: 'none',
+    revealMode: 'none',
+    remeasureOn: 'manual',
+  });
+  const engine = rippling._engine;
+  const originalChars = rippling._chars;
+
+  try {
+    rippling.update({ radius: 99 });
+    assert.deepEqual(order, ['reveal', 'burn', 'redact']);
+
+    rippling.destroy();
+    assert.deepEqual(rippling._chars, []);
+    assert.deepEqual(engine._chars, []);
+    assert.notEqual(engine._chars, originalChars);
+    assert.equal(engine._element, null);
+    assert.doesNotThrow(() => rippling._tick(20, 0));
+  } finally {
+    for (let i = 0; i < modules.length; i++) modules[i][1].onUpdate = originals[i];
+    if (!rippling._destroyed) rippling.destroy();
+  }
+});
