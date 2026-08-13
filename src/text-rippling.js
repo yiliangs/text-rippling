@@ -4,86 +4,379 @@
 // Drop in via <script src="text-rippling.js"></script> and use the global
 // `TextRippling` constructor. Also exposes CommonJS exports for Node /
 // bundlers; an ESM wrapper lives at `text-rippling.mjs`.
-//
-// ── Internal architecture ────────────────────────────────────────────────
-//
-//   ┌──────────── Public API ────────────┐
-//   │ new TextRippling(element, options) │
-//   └─────────────────┬──────────────────┘
-//                     │
-//   ┌─────────────────▼──────────────────────────────────────────────┐
-//   │  TextRippling (façade)                                          │
-//   │   constructor → Splitter.split → measure → bind → register      │
-//   │   _tick(now) →  for each Char:                                  │
-//   │                   target = Effect(char, ctx)                    │
-//   │                   Char.integrate(target)   // spring + lerp     │
-//   │                   Renderer.write(char)     // transform/color/glyph│
-//   └─────────────────┬──────────────────────────────────────────────┘
-//                     │
-//   ┌─────────────────▼──────────────────────────────────────────────┐
-//   │  Subsystems (singletons / pure)                                 │
-//   │   CursorField   — pointer position, velocity, stamp ring buffer │
-//   │   AnimationLoop — single shared rAF, drives all instances        │
-//   │   Splitter      — text → Char[]                                 │
-//   │   Renderer      — pure DOM-write functions (idle-skipping)       │
-//   │   Effects       — registry of (ctx → target) functions           │
-//   │   Falloffs      — registry of (dist, radius → weight) functions  │
-//   │   GlyphPickers  — registry of (originalChar, opts → string)      │
-//   │   Ripple        — self-contained ring-wave physics; the          │
-//   │                   `ripple` Effects entry is a thin adapter onto it│
-//   │   RevealLayer   — sticky two-layer text overlay; cursor-proximity │
-//   │                   driven, latches once and stays                  │
-//   │   WaveReveal    — reversible two-layer overlay; wave-amplitude    │
-//   │                   driven, dithered per-char threshold (Ripple)    │
-//   │   BurnReveal    — paper-burn reveal of the element's own text     │
-//   │                   from under a twinkling procedural mask; per-    │
-//   │                   char heat field + creeping smolder front        │
-//   │   Color         — parse / lerp utilities                        │
-//   └─────────────────────────────────────────────────────────────────┘
-
-(function (root) {
+// Generated from the authored modules in source/.
+(function () {
   'use strict';
 
   const VERSION = '0.1.0';
 
-  // Reference frame interval (≈60Hz) — the rate the per-step integrator
+  // Reference frame interval (≈60Hz), the rate the per-step integrator
   // constants in DEFAULTS are tuned for. The dt-aware integrators rescale
   // to this so visible behavior is identical across refresh rates.
   const REF_DT_MS = 16.67;
 
+  // Frozen rest target, returned when a char has no active influence so
+  // the integrators have a known-zero state without per-char allocation.
+  const REST = Object.freeze({
+    tx: 0,
+    ty: 0,
+    rot: 0,
+    scale: 1,
+    brightness: 0,
+    scramble: 0,
+    interior: false,
+  });
+
   // ════════════════════════════════════════════════════════════════════
-  //  Color — parse "#rgb" / "#rrggbb" / "rgb(...)" / "rgba(...)" → [r,g,b]
+  //  BurnReveal — paper-burn reveal over a twinkling ASCII mask ('burn').
+  //
+  //  Inverts the family's authoring contract: the other reveal modes
+  //  treat the element's HTML as the visible surface and `revealText` /
+  //  `data-reveal` as the hidden layer, but here the surface is
+  //  PROCEDURAL — every char is covered by a random glyph drawn from
+  //  `glyphPool` — so the element's own text IS the hidden payload and
+  //  `revealText` is not consulted. (Side benefit: the real prose stays
+  //  in the DOM for copy/paste, screen readers, and search.)
+  //
+  //  Three cooperating behaviors:
+  //
+  //  1. TWINKLE — unburned mask glyphs re-roll at slow randomized
+  //     intervals (mean `burnTwinkleMs`), like stars; the hotter a
+  //     char gets, the faster it flickers.
+  //
+  //  2. BURN — a per-char heat scalar in [0,1], integrated per frame
+  //     from two inputs:
+  //       cursor  : heat/s = burnRate · prox^FOCUS inside burnRadius —
+  //                 chars under the pointer combust near-instantly,
+  //                 chars at the fringe only warm up.
+  //       smolder : chars at/above `burnIgnite` (the kindling point)
+  //                 self-sustain at the full smolder rate and radiate
+  //                 to neighbors within `burnSmolderReach`.
+  //     There is NO extinction: once anything is burning, the front
+  //     keeps creeping — however slowly — until it runs out of
+  //     reachable text. `burnIgnite` is the point of no return; below
+  //     it a char cools back off when nothing within reach is
+  //     radiating (a grazed char glows faintly and fades; one the
+  //     fire reaches inevitably completes). Heat reaching 1 is
+  //     permanent (paper doesn't unburn) — the char latches
+  //     c.revealed and shows its own glyph.
+  //
+  //  3. BLOOM-RIPPLE ADOPTION — burned chars join the bloom-ripple
+  //     color contract (static `revealColor` at rest, lerped toward
+  //     `wakeColor` by ripple brightness — pair with effect: 'ripple').
+  //     The dedicated writer (burnColorWriter below) prepends two hot
+  //     states: cover→ember by heat while burning, then an ember→
+  //     revealColor cooling flash over `burnCoolMs` right after
+  //     combustion. Chars still cooling also keep radiating, which is
+  //     how a fully burned char hands the fire onward.
+  //
+  //  Mask glyphs are swapped in-slot (same caveat as scramble, but
+  //  persistent): proportional fonts jitter layout — use monospace.
+  //
+  //  Char fields owned (via initChar): burnHeat, burnedAt, maskGlyph,
+  //  nextTwinkle. Also drives the shared c.revealed latch.
   // ════════════════════════════════════════════════════════════════════
 
-  const Color = {
-    parse(str) {
-      if (!str) return [255, 255, 255];
-      if (str.charAt(0) === '#') {
-        let hex = str.slice(1);
-        if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
-        if (hex.length === 6) {
-          const n = parseInt(hex, 16);
-          if (!isNaN(n)) return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  const BurnReveal = {
+    // Physical tuning constants — DEFAULTS mirrors these under `burn*`
+    // keys so the numbers are owned in one place (same pattern as Ripple).
+    DEFAULTS: {
+      radius:       90,        // px — cursor ignition reach
+      rate:         6,         // heat/s at cursor center (heat 1 = burned through)
+      smolderRate:  0.35,      // heat/s — self-burn past ignition; also scales neighbor radiation.
+                               // Sets the front's creep speed (~1-2 chars/s at default): the
+                               // "microburn" pace at which the fire eats on after the cursor leaves
+      smolderReach: 40,        // px — radiation reach; must clear one line-height to spread vertically
+      ignite:       0.22,      // heat threshold — below: warmth cools off; at/above: self-sustains
+      coolMs:       700,       // ms — post-combustion ember flash; char keeps radiating during it
+      emberColor:   '#ff9a3c', // CSS color of the burning edge
+      twinkleMs:    2400,      // ms — mean interval between mask glyph re-rolls
+    },
+
+    // Internal constants (not knobs).
+    COOL_RATE: 0.3,  // heat/s lost when nothing is feeding a sub-ignition char
+    FOCUS:     2.2,  // cursor proximity exponent — "way faster" close to the flame
+    MAX_DT:    50,   // ms — per-frame integration clamp (tab-switch dt spikes)
+
+    // Per-char field ownership (see Char.create hand-off).
+    initChar(c) {
+      c.burnHeat = 0;
+      c.burnedAt = 0;
+      c.maskGlyph = null;
+      c.nextTwinkle = 0;
+    },
+
+    // (Re)start the mode: reset burn state and mask every char NOW —
+    // waiting for the first tick would flash one frame of the payload
+    // text. Called from the constructor and on revealMode switches.
+    attach(chars, opts) {
+      for (const c of chars) {
+        c.burnHeat = 0;
+        c.burnedAt = 0;
+        c.revealed = false;
+        c.maskGlyph = burnMaskGlyph(opts.glyphPool, null);
+        c.nextTwinkle = 0; // frame() staggers the first re-roll
+        c.textEl.textContent = c.maskGlyph;
+      }
+    },
+
+    // Lifecycle hook for TextRippling.update() — mask on entry; on exit
+    // clear the burn state so revealed latches don't leak into the next
+    // mode's writer (the new mode's naturalGlyph resolver restores the
+    // original glyphs on its first tick).
+    onUpdate(prev, curr, chars) {
+      if (prev.revealMode !== 'burn' && curr.revealMode === 'burn') {
+        BurnReveal.attach(chars, curr);
+      } else if (prev.revealMode === 'burn' && curr.revealMode !== 'burn') {
+        for (const c of chars) {
+          c.burnHeat = 0;
+          c.burnedAt = 0;
+          c.revealed = false;
         }
       }
-      const m = str.match(/(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)/);
-      if (m) return [+m[1] | 0, +m[2] | 0, +m[3] | 0];
-      return [255, 255, 255];
+    },
+
+    // Per-frame orchestrator. Two passes:
+    //   1. bucket radiators (burning chars + fresh embers) into a coarse
+    //      grid, pitch = smolderReach, so the neighbor query in pass 2
+    //      touches only the 9 surrounding cells;
+    //   2. per unburned char: integrate cursor + smolder heat, handle
+    //      ignition/cooling/completion, and run the twinkle.
+    frame(chars, ctx, opts) {
+      const now = ctx.time;
+      const dt = ctx.dt < BurnReveal.MAX_DT ? ctx.dt : BurnReveal.MAX_DT;
+      const R = opts.burnRadius;
+      const RSq = R * R;
+      const reach = opts.burnSmolderReach;
+      const reachSq = reach * reach;
+      const ignite = opts.burnIgnite;
+      const kCursor = (opts.burnRate / 1000) * dt;
+      const kSmolder = (opts.burnSmolderRate / 1000) * dt;
+      const kCool = (BurnReveal.COOL_RATE / 1000) * dt;
+
+      _burnGrid.clear();
+      let radiators = 0;
+      for (let i = 0; i < chars.length; i++) {
+        const c = chars[i];
+        const radiating = c.revealed
+          ? now - c.burnedAt < opts.burnCoolMs
+          : c.burnHeat >= ignite;
+        if (!radiating) continue;
+        const key = ((c.hx / reach) | 0) * 8192 + ((c.hy / reach) | 0);
+        const bucket = _burnGrid.get(key);
+        if (bucket) bucket.push(c); else _burnGrid.set(key, [c]);
+        radiators++;
+      }
+
+      for (let i = 0; i < chars.length; i++) {
+        const c = chars[i];
+        if (c.revealed) continue;
+
+        let input = 0;
+
+        // Cursor: the flame itself. Superlinear proximity ramp so the
+        // center combusts near-instantly while the fringe only warms.
+        const dx = c.hx - ctx.mouseX;
+        const dy = c.hy - ctx.mouseY;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < RSq) {
+          const prox = 1 - Math.sqrt(d2) / R;
+          input += kCursor * Math.pow(prox, BurnReveal.FOCUS);
+        }
+
+        // Smolder: radiation from burning neighbors. Contributions sum
+        // (a wider front burns hotter) but are capped so a dense blaze
+        // can't skip the burn animation entirely.
+        if (radiators > 0) {
+          const cx = (c.hx / reach) | 0;
+          const cy = (c.hy / reach) | 0;
+          let seed = 0;
+          for (let gx = cx - 1; gx <= cx + 1; gx++) {
+            for (let gy = cy - 1; gy <= cy + 1; gy++) {
+              const bucket = _burnGrid.get(gx * 8192 + gy);
+              if (!bucket) continue;
+              for (let b = 0; b < bucket.length; b++) {
+                const r = bucket[b];
+                const rdx = r.hx - c.hx;
+                const rdy = r.hy - c.hy;
+                const rd2 = rdx * rdx + rdy * rdy;
+                if (rd2 >= reachSq) continue;
+                seed += 1 - Math.sqrt(rd2) / reach;
+              }
+            }
+          }
+          if (seed > 0) {
+            if (seed > 1.4) seed = 1.4;
+            // Per-char jitter keeps the creeping front ragged.
+            input += kSmolder * seed * (0.7 + c.seed * 0.6);
+          }
+        }
+
+        // Past the kindling point a char self-sustains at the full
+        // smolder rate — the microburn that keeps the edge advancing
+        // long after the cursor has moved on. No extinction, no decay:
+        // the fire only ends when it runs out of reachable text.
+        if (c.burnHeat >= ignite) input += kSmolder;
+
+        if (input > 0) {
+          c.burnHeat += input;
+          if (c.burnHeat >= 1) {
+            // Burned through — permanent. The glyph renderer swaps in
+            // the payload char this same tick via burnNaturalGlyph.
+            c.burnHeat = 1;
+            c.revealed = true;
+            c.burnedAt = now;
+            continue;
+          }
+        } else if (c.burnHeat > 0) {
+          // Nothing burning within reach and no flame — sub-kindling
+          // warmth fades back to the cover state.
+          c.burnHeat -= kCool;
+          if (c.burnHeat < 0) c.burnHeat = 0;
+        }
+
+        // Twinkle — slow star-like re-roll; accelerates as the char heats.
+        if (c.nextTwinkle === 0) {
+          c.nextTwinkle = now + opts.burnTwinkleMs * (0.2 + Math.random());
+        } else if (now >= c.nextTwinkle) {
+          c.maskGlyph = burnMaskGlyph(opts.glyphPool, c.maskGlyph);
+          const base = opts.burnTwinkleMs * (0.5 + Math.random());
+          c.nextTwinkle = now + base * (1 - 0.85 * c.burnHeat);
+        }
+      }
     },
   };
 
+  // Draw a mask glyph from the pool, avoiding an immediate repeat so a
+  // twinkle is always a visible change. Falls back to '#' on an empty pool.
+  function burnMaskGlyph(pool, current) {
+    if (!pool || pool.length === 0) return current || '#';
+    let g = pool.charAt((Math.random() * pool.length) | 0);
+    if (g === current) g = pool.charAt((Math.random() * pool.length) | 0);
+    return g;
+  }
+
+  // Module-private radiator grid, reused frame-to-frame (same rationale
+  // as _wordScratch above).
+  const _burnGrid = new Map();
+
   // ════════════════════════════════════════════════════════════════════
-  //  Falloffs — distance-to-radius weighting curves, range [0..1].
-  //  Effects use these to scale their output by cursor proximity.
+  //  Redact — stochastic-density block redaction with morphing turnover.
+  //
+  //  Top-level effect, but implemented as a sibling module (like
+  //  RevealLayer / WaveReveal). `Effects.redact` is a no-op routing slot;
+  //  the per-char glyph swap is driven from `_tick` directly when
+  //  `opts.effect === 'redact'`.
+  //
+  //  Spatial law:
+  //    d <  redactRadius                 → redacted (always; "core")
+  //    d >= redactRadius + redactFringe  → not redacted
+  //    in band                           → redacted iff this char is
+  //                                         currently in the redacted
+  //                                         subset of the band.
+  //
+  //  Band entry seeds each char by gradient probability p(d) = (B-d)/(B-A),
+  //  so initial density is 1.0 at the inner edge and 0.0 at the outer edge.
+  //
+  //  Morphing: every `redactTurnoverMs` (default 500ms, i.e. 2 turns/sec),
+  //  the turnover swaps a `redactTurnoverFrac` (default 30%) slice of the
+  //  current in-band redacted set OFF, and the same count of in-band
+  //  unredacted chars ON. Net in-band redacted count is preserved; which
+  //  specific chars are redacted shuffles. Reads as a stable cloud of
+  //  redaction whose membership churns each turn.
+  //
+  //  Per-char state (on Char): `redacted` (boolean rendered state) and
+  //  `redactZone` (0=outside, 1=core, 2=band) — the zone is tracked so
+  //  band entry can be detected and seeded once, leaving the boolean
+  //  state otherwise to the turnover.
   // ════════════════════════════════════════════════════════════════════
 
-  const Falloffs = {
-    gaussian: (d, r) => Math.exp(-((d / r) * (d / r)) * 2.5),
-    linear:   (d, r) => Math.max(0, 1 - d / r),
-    inverse:  (d, r) => 1 / (1 + (d / r) * (d / r) * 4),
-    smooth:   (d, r) => {
-      const t = Math.max(0, 1 - d / r);
-      return t * t * (3 - 2 * t);
+  const Redact = {
+    // Per-char field ownership: this module is responsible for these
+    // three Char fields, populated by Char.create via initChar.
+    //
+    //   redacted    — boolean : currently rendered as the cover bar
+    //   redactZone  — 0/1/2  : 0=outside, 1=core, 2=band (entry detection)
+    //   coverShown  — boolean : renderer-side latch for Renderer.cover
+    initChar(c) {
+      c.redacted = false;
+      c.redactZone = 0;
+      c.coverShown = false;
+    },
+
+    // Lifecycle hook: react to options changes from TextRippling.update().
+    //   - Effect switched away from 'redact' → clear per-char state so
+    //     Renderer.cover hides any still-shown bars on the next tick.
+    //   - redactColor changed → re-paint every cover element so chars
+    //     currently covered show the new color immediately.
+    onUpdate(prev, curr, chars) {
+      if (prev.effect === 'redact' && curr.effect !== 'redact') {
+        for (const c of chars) {
+          c.redacted = false;
+          c.redactZone = 0;
+        }
+      }
+      if (curr.redactColor !== prev.redactColor) {
+        const bg = curr.redactColor || 'currentColor';
+        for (const c of chars) c.coverEl.style.background = bg;
+      }
+    },
+
+    tick(c, ctx, opts) {
+      const dx = c.hx - ctx.mouseX;
+      const dy = c.hy - ctx.mouseY;
+      const d2 = dx * dx + dy * dy;
+      const innerR = opts.redactRadius;
+      const outerR = innerR + opts.redactFringe;
+
+      if (d2 < innerR * innerR) {
+        c.redacted = true;
+        c.redactZone = 1;
+      } else if (d2 >= outerR * outerR) {
+        c.redacted = false;
+        c.redactZone = 0;
+      } else if (c.redactZone !== 2) {
+        // Just entered the band from outside or from the core — seed the
+        // boolean state by the position's gradient probability. After
+        // this, the turnover owns transitions until the char leaves the
+        // band again.
+        const d = Math.sqrt(d2);
+        const p = (outerR - d) / (outerR - innerR);
+        c.redacted = Math.random() < p;
+        c.redactZone = 2;
+      }
+    },
+
+    // Picks redactTurnoverFrac of currently-redacted band chars and
+    // unredacts them; picks the same count of currently-unredacted band
+    // chars and redacts them. Net count preserved — only the membership
+    // churns. Linear in chars.length; allocates two arrays per call.
+    turnover(chars, opts) {
+      const onSet = [];
+      const offSet = [];
+      for (const c of chars) {
+        if (c.redactZone !== 2) continue;
+        (c.redacted ? onSet : offSet).push(c);
+      }
+      // Symmetric swap: flip the same count both directions so the
+      // total in-band redacted count is exactly preserved per turn.
+      // Capped by both sides — if the band is near-saturated and the
+      // unredacted pool is smaller than 30% of the redacted pool, the
+      // swap shrinks to the smaller pool's size.
+      const want = Math.floor(onSet.length * opts.redactTurnoverFrac);
+      const swap = Math.min(want, offSet.length);
+      // Partial Fisher–Yates: only the first N entries need to be a
+      // uniform random pick, so we stop after N swaps.
+      const pickFirst = (arr, n) => {
+        for (let i = 0; i < n; i++) {
+          const j = i + ((Math.random() * (arr.length - i)) | 0);
+          const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+        }
+      };
+      pickFirst(onSet, swap);
+      for (let i = 0; i < swap; i++) onSet[i].redacted = false;
+      pickFirst(offSet, swap);
+      for (let i = 0; i < swap; i++) offSet[i].redacted = true;
     },
   };
 
@@ -577,496 +870,6 @@
   };
 
   // ════════════════════════════════════════════════════════════════════
-  //  BurnReveal — paper-burn reveal over a twinkling ASCII mask ('burn').
-  //
-  //  Inverts the family's authoring contract: the other reveal modes
-  //  treat the element's HTML as the visible surface and `revealText` /
-  //  `data-reveal` as the hidden layer, but here the surface is
-  //  PROCEDURAL — every char is covered by a random glyph drawn from
-  //  `glyphPool` — so the element's own text IS the hidden payload and
-  //  `revealText` is not consulted. (Side benefit: the real prose stays
-  //  in the DOM for copy/paste, screen readers, and search.)
-  //
-  //  Three cooperating behaviors:
-  //
-  //  1. TWINKLE — unburned mask glyphs re-roll at slow randomized
-  //     intervals (mean `burnTwinkleMs`), like stars; the hotter a
-  //     char gets, the faster it flickers.
-  //
-  //  2. BURN — a per-char heat scalar in [0,1], integrated per frame
-  //     from two inputs:
-  //       cursor  : heat/s = burnRate · prox^FOCUS inside burnRadius —
-  //                 chars under the pointer combust near-instantly,
-  //                 chars at the fringe only warm up.
-  //       smolder : chars at/above `burnIgnite` (the kindling point)
-  //                 self-sustain at the full smolder rate and radiate
-  //                 to neighbors within `burnSmolderReach`.
-  //     There is NO extinction: once anything is burning, the front
-  //     keeps creeping — however slowly — until it runs out of
-  //     reachable text. `burnIgnite` is the point of no return; below
-  //     it a char cools back off when nothing within reach is
-  //     radiating (a grazed char glows faintly and fades; one the
-  //     fire reaches inevitably completes). Heat reaching 1 is
-  //     permanent (paper doesn't unburn) — the char latches
-  //     c.revealed and shows its own glyph.
-  //
-  //  3. BLOOM-RIPPLE ADOPTION — burned chars join the bloom-ripple
-  //     color contract (static `revealColor` at rest, lerped toward
-  //     `wakeColor` by ripple brightness — pair with effect: 'ripple').
-  //     The dedicated writer (burnColorWriter below) prepends two hot
-  //     states: cover→ember by heat while burning, then an ember→
-  //     revealColor cooling flash over `burnCoolMs` right after
-  //     combustion. Chars still cooling also keep radiating, which is
-  //     how a fully burned char hands the fire onward.
-  //
-  //  Mask glyphs are swapped in-slot (same caveat as scramble, but
-  //  persistent): proportional fonts jitter layout — use monospace.
-  //
-  //  Char fields owned (via initChar): burnHeat, burnedAt, maskGlyph,
-  //  nextTwinkle. Also drives the shared c.revealed latch.
-  // ════════════════════════════════════════════════════════════════════
-
-  const BurnReveal = {
-    // Physical tuning constants — DEFAULTS mirrors these under `burn*`
-    // keys so the numbers are owned in one place (same pattern as Ripple).
-    DEFAULTS: {
-      radius:       90,        // px — cursor ignition reach
-      rate:         6,         // heat/s at cursor center (heat 1 = burned through)
-      smolderRate:  0.35,      // heat/s — self-burn past ignition; also scales neighbor radiation.
-                               // Sets the front's creep speed (~1-2 chars/s at default): the
-                               // "microburn" pace at which the fire eats on after the cursor leaves
-      smolderReach: 40,        // px — radiation reach; must clear one line-height to spread vertically
-      ignite:       0.22,      // heat threshold — below: warmth cools off; at/above: self-sustains
-      coolMs:       700,       // ms — post-combustion ember flash; char keeps radiating during it
-      emberColor:   '#ff9a3c', // CSS color of the burning edge
-      twinkleMs:    2400,      // ms — mean interval between mask glyph re-rolls
-    },
-
-    // Internal constants (not knobs).
-    COOL_RATE: 0.3,  // heat/s lost when nothing is feeding a sub-ignition char
-    FOCUS:     2.2,  // cursor proximity exponent — "way faster" close to the flame
-    MAX_DT:    50,   // ms — per-frame integration clamp (tab-switch dt spikes)
-
-    // Per-char field ownership (see Char.create hand-off).
-    initChar(c) {
-      c.burnHeat = 0;
-      c.burnedAt = 0;
-      c.maskGlyph = null;
-      c.nextTwinkle = 0;
-    },
-
-    // (Re)start the mode: reset burn state and mask every char NOW —
-    // waiting for the first tick would flash one frame of the payload
-    // text. Called from the constructor and on revealMode switches.
-    attach(chars, opts) {
-      for (const c of chars) {
-        c.burnHeat = 0;
-        c.burnedAt = 0;
-        c.revealed = false;
-        c.maskGlyph = burnMaskGlyph(opts.glyphPool, null);
-        c.nextTwinkle = 0; // frame() staggers the first re-roll
-        c.textEl.textContent = c.maskGlyph;
-      }
-    },
-
-    // Lifecycle hook for TextRippling.update() — mask on entry; on exit
-    // clear the burn state so revealed latches don't leak into the next
-    // mode's writer (the new mode's naturalGlyph resolver restores the
-    // original glyphs on its first tick).
-    onUpdate(prev, curr, chars) {
-      if (prev.revealMode !== 'burn' && curr.revealMode === 'burn') {
-        BurnReveal.attach(chars, curr);
-      } else if (prev.revealMode === 'burn' && curr.revealMode !== 'burn') {
-        for (const c of chars) {
-          c.burnHeat = 0;
-          c.burnedAt = 0;
-          c.revealed = false;
-        }
-      }
-    },
-
-    // Per-frame orchestrator. Two passes:
-    //   1. bucket radiators (burning chars + fresh embers) into a coarse
-    //      grid, pitch = smolderReach, so the neighbor query in pass 2
-    //      touches only the 9 surrounding cells;
-    //   2. per unburned char: integrate cursor + smolder heat, handle
-    //      ignition/cooling/completion, and run the twinkle.
-    frame(chars, ctx, opts) {
-      const now = ctx.time;
-      const dt = ctx.dt < BurnReveal.MAX_DT ? ctx.dt : BurnReveal.MAX_DT;
-      const R = opts.burnRadius;
-      const RSq = R * R;
-      const reach = opts.burnSmolderReach;
-      const reachSq = reach * reach;
-      const ignite = opts.burnIgnite;
-      const kCursor = (opts.burnRate / 1000) * dt;
-      const kSmolder = (opts.burnSmolderRate / 1000) * dt;
-      const kCool = (BurnReveal.COOL_RATE / 1000) * dt;
-
-      _burnGrid.clear();
-      let radiators = 0;
-      for (let i = 0; i < chars.length; i++) {
-        const c = chars[i];
-        const radiating = c.revealed
-          ? now - c.burnedAt < opts.burnCoolMs
-          : c.burnHeat >= ignite;
-        if (!radiating) continue;
-        const key = ((c.hx / reach) | 0) * 8192 + ((c.hy / reach) | 0);
-        const bucket = _burnGrid.get(key);
-        if (bucket) bucket.push(c); else _burnGrid.set(key, [c]);
-        radiators++;
-      }
-
-      for (let i = 0; i < chars.length; i++) {
-        const c = chars[i];
-        if (c.revealed) continue;
-
-        let input = 0;
-
-        // Cursor: the flame itself. Superlinear proximity ramp so the
-        // center combusts near-instantly while the fringe only warms.
-        const dx = c.hx - ctx.mouseX;
-        const dy = c.hy - ctx.mouseY;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < RSq) {
-          const prox = 1 - Math.sqrt(d2) / R;
-          input += kCursor * Math.pow(prox, BurnReveal.FOCUS);
-        }
-
-        // Smolder: radiation from burning neighbors. Contributions sum
-        // (a wider front burns hotter) but are capped so a dense blaze
-        // can't skip the burn animation entirely.
-        if (radiators > 0) {
-          const cx = (c.hx / reach) | 0;
-          const cy = (c.hy / reach) | 0;
-          let seed = 0;
-          for (let gx = cx - 1; gx <= cx + 1; gx++) {
-            for (let gy = cy - 1; gy <= cy + 1; gy++) {
-              const bucket = _burnGrid.get(gx * 8192 + gy);
-              if (!bucket) continue;
-              for (let b = 0; b < bucket.length; b++) {
-                const r = bucket[b];
-                const rdx = r.hx - c.hx;
-                const rdy = r.hy - c.hy;
-                const rd2 = rdx * rdx + rdy * rdy;
-                if (rd2 >= reachSq) continue;
-                seed += 1 - Math.sqrt(rd2) / reach;
-              }
-            }
-          }
-          if (seed > 0) {
-            if (seed > 1.4) seed = 1.4;
-            // Per-char jitter keeps the creeping front ragged.
-            input += kSmolder * seed * (0.7 + c.seed * 0.6);
-          }
-        }
-
-        // Past the kindling point a char self-sustains at the full
-        // smolder rate — the microburn that keeps the edge advancing
-        // long after the cursor has moved on. No extinction, no decay:
-        // the fire only ends when it runs out of reachable text.
-        if (c.burnHeat >= ignite) input += kSmolder;
-
-        if (input > 0) {
-          c.burnHeat += input;
-          if (c.burnHeat >= 1) {
-            // Burned through — permanent. The glyph renderer swaps in
-            // the payload char this same tick via burnNaturalGlyph.
-            c.burnHeat = 1;
-            c.revealed = true;
-            c.burnedAt = now;
-            continue;
-          }
-        } else if (c.burnHeat > 0) {
-          // Nothing burning within reach and no flame — sub-kindling
-          // warmth fades back to the cover state.
-          c.burnHeat -= kCool;
-          if (c.burnHeat < 0) c.burnHeat = 0;
-        }
-
-        // Twinkle — slow star-like re-roll; accelerates as the char heats.
-        if (c.nextTwinkle === 0) {
-          c.nextTwinkle = now + opts.burnTwinkleMs * (0.2 + Math.random());
-        } else if (now >= c.nextTwinkle) {
-          c.maskGlyph = burnMaskGlyph(opts.glyphPool, c.maskGlyph);
-          const base = opts.burnTwinkleMs * (0.5 + Math.random());
-          c.nextTwinkle = now + base * (1 - 0.85 * c.burnHeat);
-        }
-      }
-    },
-  };
-
-  // Draw a mask glyph from the pool, avoiding an immediate repeat so a
-  // twinkle is always a visible change. Falls back to '#' on an empty pool.
-  function burnMaskGlyph(pool, current) {
-    if (!pool || pool.length === 0) return current || '#';
-    let g = pool.charAt((Math.random() * pool.length) | 0);
-    if (g === current) g = pool.charAt((Math.random() * pool.length) | 0);
-    return g;
-  }
-
-  // Module-private radiator grid, reused frame-to-frame (same rationale
-  // as _wordScratch above).
-  const _burnGrid = new Map();
-
-  // ════════════════════════════════════════════════════════════════════
-  //  Redact — stochastic-density block redaction with morphing turnover.
-  //
-  //  Top-level effect, but implemented as a sibling module (like
-  //  RevealLayer / WaveReveal). `Effects.redact` is a no-op routing slot;
-  //  the per-char glyph swap is driven from `_tick` directly when
-  //  `opts.effect === 'redact'`.
-  //
-  //  Spatial law:
-  //    d <  redactRadius                 → redacted (always; "core")
-  //    d >= redactRadius + redactFringe  → not redacted
-  //    in band                           → redacted iff this char is
-  //                                         currently in the redacted
-  //                                         subset of the band.
-  //
-  //  Band entry seeds each char by gradient probability p(d) = (B-d)/(B-A),
-  //  so initial density is 1.0 at the inner edge and 0.0 at the outer edge.
-  //
-  //  Morphing: every `redactTurnoverMs` (default 500ms, i.e. 2 turns/sec),
-  //  the turnover swaps a `redactTurnoverFrac` (default 30%) slice of the
-  //  current in-band redacted set OFF, and the same count of in-band
-  //  unredacted chars ON. Net in-band redacted count is preserved; which
-  //  specific chars are redacted shuffles. Reads as a stable cloud of
-  //  redaction whose membership churns each turn.
-  //
-  //  Per-char state (on Char): `redacted` (boolean rendered state) and
-  //  `redactZone` (0=outside, 1=core, 2=band) — the zone is tracked so
-  //  band entry can be detected and seeded once, leaving the boolean
-  //  state otherwise to the turnover.
-  // ════════════════════════════════════════════════════════════════════
-
-  const Redact = {
-    // Per-char field ownership: this module is responsible for these
-    // three Char fields, populated by Char.create via initChar.
-    //
-    //   redacted    — boolean : currently rendered as the cover bar
-    //   redactZone  — 0/1/2  : 0=outside, 1=core, 2=band (entry detection)
-    //   coverShown  — boolean : renderer-side latch for Renderer.cover
-    initChar(c) {
-      c.redacted = false;
-      c.redactZone = 0;
-      c.coverShown = false;
-    },
-
-    // Lifecycle hook: react to options changes from TextRippling.update().
-    //   - Effect switched away from 'redact' → clear per-char state so
-    //     Renderer.cover hides any still-shown bars on the next tick.
-    //   - redactColor changed → re-paint every cover element so chars
-    //     currently covered show the new color immediately.
-    onUpdate(prev, curr, chars) {
-      if (prev.effect === 'redact' && curr.effect !== 'redact') {
-        for (const c of chars) {
-          c.redacted = false;
-          c.redactZone = 0;
-        }
-      }
-      if (curr.redactColor !== prev.redactColor) {
-        const bg = curr.redactColor || 'currentColor';
-        for (const c of chars) c.coverEl.style.background = bg;
-      }
-    },
-
-    tick(c, ctx, opts) {
-      const dx = c.hx - ctx.mouseX;
-      const dy = c.hy - ctx.mouseY;
-      const d2 = dx * dx + dy * dy;
-      const innerR = opts.redactRadius;
-      const outerR = innerR + opts.redactFringe;
-
-      if (d2 < innerR * innerR) {
-        c.redacted = true;
-        c.redactZone = 1;
-      } else if (d2 >= outerR * outerR) {
-        c.redacted = false;
-        c.redactZone = 0;
-      } else if (c.redactZone !== 2) {
-        // Just entered the band from outside or from the core — seed the
-        // boolean state by the position's gradient probability. After
-        // this, the turnover owns transitions until the char leaves the
-        // band again.
-        const d = Math.sqrt(d2);
-        const p = (outerR - d) / (outerR - innerR);
-        c.redacted = Math.random() < p;
-        c.redactZone = 2;
-      }
-    },
-
-    // Picks redactTurnoverFrac of currently-redacted band chars and
-    // unredacts them; picks the same count of currently-unredacted band
-    // chars and redacts them. Net count preserved — only the membership
-    // churns. Linear in chars.length; allocates two arrays per call.
-    turnover(chars, opts) {
-      const onSet = [];
-      const offSet = [];
-      for (const c of chars) {
-        if (c.redactZone !== 2) continue;
-        (c.redacted ? onSet : offSet).push(c);
-      }
-      // Symmetric swap: flip the same count both directions so the
-      // total in-band redacted count is exactly preserved per turn.
-      // Capped by both sides — if the band is near-saturated and the
-      // unredacted pool is smaller than 30% of the redacted pool, the
-      // swap shrinks to the smaller pool's size.
-      const want = Math.floor(onSet.length * opts.redactTurnoverFrac);
-      const swap = Math.min(want, offSet.length);
-      // Partial Fisher–Yates: only the first N entries need to be a
-      // uniform random pick, so we stop after N swaps.
-      const pickFirst = (arr, n) => {
-        for (let i = 0; i < n; i++) {
-          const j = i + ((Math.random() * (arr.length - i)) | 0);
-          const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
-        }
-      };
-      pickFirst(onSet, swap);
-      for (let i = 0; i < swap; i++) onSet[i].redacted = false;
-      pickFirst(offSet, swap);
-      for (let i = 0; i < swap; i++) offSet[i].redacted = true;
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
-  //  Effects — pure (dx, dy, dist, f, opts, ctx) → targetState.
-  //
-  //  Sign convention: dx,dy = (charCenter − mouse). Positive dx means
-  //  char is to the right of cursor, so REPEL pushes it further right.
-  //
-  //  Target schema (all fields optional, defaults are the rest state):
-  //    { tx, ty, rot, scale, brightness, scramble }
-  //
-  //  Effects with `.global = true` are called every frame regardless of
-  //  cursor proximity — they read state from ctx (e.g. ctx.stamps).
-  // ════════════════════════════════════════════════════════════════════
-
-  const Effects = {
-    // No motion / brightness / scramble. Useful when an instance only
-    // wants the RevealLayer feature (or any other independent module
-    // that doesn't depend on per-char effect output).
-    none() { return REST; },
-
-    // Pure displacement: chars pushed away from the cursor.
-    repel(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: dx * k, ty: dy * k };
-    },
-
-    // Inverse of repel: chars pulled toward the cursor.
-    attract(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: -dx * k, ty: -dy * k };
-    },
-
-    // Repel + scale + tilt — feels like soft jelly being pushed.
-    jelly(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: dx * k, ty: dy * k, rot: dx * f * 0.0015 * p.strength, scale: 1 + f * 0.6 };
-    },
-
-    // Vertical sine wave; cursor X drives phase, falloff modulates amplitude.
-    wave(dx, dy, dist, f, p, ctx) {
-      const phase = (ctx.charX - ctx.mouseX) * 0.02 + ctx.time * 0.004;
-      return { ty: Math.sin(phase) * f * p.strength };
-    },
-
-    // Chars under the cursor swell up — distance only scales, no displacement.
-    magnify(dx, dy, dist, f, p) {
-      return { ty: -f * p.strength * 0.4, scale: 1 + f * 0.9 };
-    },
-
-    // Each char has a private direction; cursor controls intensity.
-    scatter(dx, dy, dist, f, p, ctx) {
-      const a = ctx.charSeed * Math.PI * 2;
-      const r = f * p.strength;
-      return { tx: Math.cos(a) * r, ty: Math.sin(a) * r, rot: ctx.charSeed * f * 0.6 };
-    },
-
-    // Tangential push — letters orbit around the cursor (90° CCW rotation of dx,dy).
-    swirl(dx, dy, dist, f, p) {
-      const k = (f * p.strength) / Math.max(dist, 1e-4);
-      return { tx: -dy * k, ty: dx * k };
-    },
-
-    // Rudimentary "matrix" wake: bright + glyph swap proportional to falloff.
-    // Kept for flavor; the physically-grounded effect is `ripple` below.
-    wake(dx, dy, dist, f) {
-      return { brightness: f, scramble: f };
-    },
-
-    // Brightness-only wake — glow trail without the glyph swap.
-    glow(dx, dy, dist, f) {
-      return { brightness: f };
-    },
-
-    // Top-level stochastic-density redaction. The glyph swap and
-    // morphing turnover live in the `Redact` module above; this slot
-    // is a routing flag — _tick checks `opts.effect === 'redact'` and
-    // dispatches to Redact directly. Returns REST so no transform/
-    // brightness/scramble target is produced.
-    redact() { return REST; },
-
-    // ── ripple — Effects-registry adapter onto the Ripple subsystem ───
-    //
-    // The physics lives in the `Ripple` module above; this slot exists so
-    // the registry can dispatch on `effect: 'ripple'`. Marked .global below
-    // so _tick calls it for every char regardless of cursor proximity —
-    // the wake reaches across the whole page, not just the falloff radius.
-    // Ignores dx/dy/f because wake amplitude is determined by stamp history,
-    // not by the current cursor distance.
-    //
-    // Memo: when wave / bloom-ripple modes are active, wordWaveFrame
-    // already computed Ripple for this char this frame and stashed it on
-    // c._rippleStash. Reuse it to avoid a second O(stamps) loop. Frame
-    // mismatch → stash is from a previous frame (or never populated, e.g.
-    // cursor mode) → recompute as before.
-    ripple(dx, dy, dist, f, p, ctx) {
-      const c = ctx.char;
-      if (c && c._rippleStashFrame === ctx.frameId) {
-        return c._rippleStash || REST;
-      }
-      return Ripple.compute(
-        ctx.charX, ctx.charY, ctx.time, ctx.stamps,
-        p.rippleSpeed, p.rippleSpatialAtten, p.ripplePostHit, p.rippleEdge,
-      ) || REST;
-    },
-  };
-
-  Effects.ripple.global = true;
-
-  // ════════════════════════════════════════════════════════════════════
-  //  GlyphPickers — strategies for choosing the substituted glyph.
-  // ════════════════════════════════════════════════════════════════════
-
-  function pickSymbol(opts) {
-    const s = opts.swapSymbols;
-    if (!s || s.length === 0) return null;
-    return s.charAt((Math.random() * s.length) | 0);
-  }
-
-  const GlyphPickers = {
-    // Uniform random pick from `glyphPool`. Matrix-style chaos.
-    pool(originalChar, opts) {
-      const pool = opts.glyphPool;
-      if (!pool || pool.length === 0) return null;
-      return pool.charAt((Math.random() * pool.length) | 0);
-    },
-
-    // Mostly toggle letter case (A↔a); ~8% of the time draw a symbol
-    // from `swapSymbols`. Non-letters always draw a symbol. Closer to the
-    // Pudgy Penguins reference effect — feels typographic, not glitchy.
-    caseFlip(originalChar, opts) {
-      if (Math.random() < 0.08) return pickSymbol(opts);
-      const lower = originalChar.toLowerCase();
-      const upper = originalChar.toUpperCase();
-      if (lower !== upper) return originalChar === upper ? lower : upper;
-      return pickSymbol(opts);
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════
   //  CursorField — global pointer state + wave-stamp ring buffer.
   //
   //  Singleton. Multiple TextRippling instances share one cursor.
@@ -1217,6 +1020,179 @@
 
     return { add, remove };
   })();
+
+  // ════════════════════════════════════════════════════════════════════
+  //  Falloffs — distance-to-radius weighting curves, range [0..1].
+  //  Effects use these to scale their output by cursor proximity.
+  // ════════════════════════════════════════════════════════════════════
+
+  const Falloffs = {
+    gaussian: (d, r) => Math.exp(-((d / r) * (d / r)) * 2.5),
+    linear:   (d, r) => Math.max(0, 1 - d / r),
+    inverse:  (d, r) => 1 / (1 + (d / r) * (d / r) * 4),
+    smooth:   (d, r) => {
+      const t = Math.max(0, 1 - d / r);
+      return t * t * (3 - 2 * t);
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  Effects — pure (dx, dy, dist, f, opts, ctx) → targetState.
+  //
+  //  Sign convention: dx,dy = (charCenter − mouse). Positive dx means
+  //  char is to the right of cursor, so REPEL pushes it further right.
+  //
+  //  Target schema (all fields optional, defaults are the rest state):
+  //    { tx, ty, rot, scale, brightness, scramble }
+  //
+  //  Effects with `.global = true` are called every frame regardless of
+  //  cursor proximity — they read state from ctx (e.g. ctx.stamps).
+  // ════════════════════════════════════════════════════════════════════
+
+  const Effects = {
+    // No motion / brightness / scramble. Useful when an instance only
+    // wants the RevealLayer feature (or any other independent module
+    // that doesn't depend on per-char effect output).
+    none() { return REST; },
+
+    // Pure displacement: chars pushed away from the cursor.
+    repel(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: dx * k, ty: dy * k };
+    },
+
+    // Inverse of repel: chars pulled toward the cursor.
+    attract(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: -dx * k, ty: -dy * k };
+    },
+
+    // Repel + scale + tilt — feels like soft jelly being pushed.
+    jelly(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: dx * k, ty: dy * k, rot: dx * f * 0.0015 * p.strength, scale: 1 + f * 0.6 };
+    },
+
+    // Vertical sine wave; cursor X drives phase, falloff modulates amplitude.
+    wave(dx, dy, dist, f, p, ctx) {
+      const phase = (ctx.charX - ctx.mouseX) * 0.02 + ctx.time * 0.004;
+      return { ty: Math.sin(phase) * f * p.strength };
+    },
+
+    // Chars under the cursor swell up — distance only scales, no displacement.
+    magnify(dx, dy, dist, f, p) {
+      return { ty: -f * p.strength * 0.4, scale: 1 + f * 0.9 };
+    },
+
+    // Each char has a private direction; cursor controls intensity.
+    scatter(dx, dy, dist, f, p, ctx) {
+      const a = ctx.charSeed * Math.PI * 2;
+      const r = f * p.strength;
+      return { tx: Math.cos(a) * r, ty: Math.sin(a) * r, rot: ctx.charSeed * f * 0.6 };
+    },
+
+    // Tangential push — letters orbit around the cursor (90° CCW rotation of dx,dy).
+    swirl(dx, dy, dist, f, p) {
+      const k = (f * p.strength) / Math.max(dist, 1e-4);
+      return { tx: -dy * k, ty: dx * k };
+    },
+
+    // Rudimentary "matrix" wake: bright + glyph swap proportional to falloff.
+    // Kept for flavor; the physically-grounded effect is `ripple` below.
+    wake(dx, dy, dist, f) {
+      return { brightness: f, scramble: f };
+    },
+
+    // Brightness-only wake — glow trail without the glyph swap.
+    glow(dx, dy, dist, f) {
+      return { brightness: f };
+    },
+
+    // Top-level stochastic-density redaction. The glyph swap and
+    // morphing turnover live in the `Redact` module above; this slot
+    // is a routing flag — _tick checks `opts.effect === 'redact'` and
+    // dispatches to Redact directly. Returns REST so no transform/
+    // brightness/scramble target is produced.
+    redact() { return REST; },
+
+    // ── ripple — Effects-registry adapter onto the Ripple subsystem ───
+    //
+    // The physics lives in the `Ripple` module above; this slot exists so
+    // the registry can dispatch on `effect: 'ripple'`. Marked .global below
+    // so _tick calls it for every char regardless of cursor proximity —
+    // the wake reaches across the whole page, not just the falloff radius.
+    // Ignores dx/dy/f because wake amplitude is determined by stamp history,
+    // not by the current cursor distance.
+    //
+    // Memo: when wave / bloom-ripple modes are active, wordWaveFrame
+    // already computed Ripple for this char this frame and stashed it on
+    // c._rippleStash. Reuse it to avoid a second O(stamps) loop. Frame
+    // mismatch → stash is from a previous frame (or never populated, e.g.
+    // cursor mode) → recompute as before.
+    ripple(dx, dy, dist, f, p, ctx) {
+      const c = ctx.char;
+      if (c && c._rippleStashFrame === ctx.frameId) {
+        return c._rippleStash || REST;
+      }
+      return Ripple.compute(
+        ctx.charX, ctx.charY, ctx.time, ctx.stamps,
+        p.rippleSpeed, p.rippleSpatialAtten, p.ripplePostHit, p.rippleEdge,
+      ) || REST;
+    },
+  };
+
+  Effects.ripple.global = true;
+
+  // ════════════════════════════════════════════════════════════════════
+  //  GlyphPickers — strategies for choosing the substituted glyph.
+  // ════════════════════════════════════════════════════════════════════
+
+  function pickSymbol(opts) {
+    const s = opts.swapSymbols;
+    if (!s || s.length === 0) return null;
+    return s.charAt((Math.random() * s.length) | 0);
+  }
+
+  const GlyphPickers = {
+    // Uniform random pick from `glyphPool`. Matrix-style chaos.
+    pool(originalChar, opts) {
+      const pool = opts.glyphPool;
+      if (!pool || pool.length === 0) return null;
+      return pool.charAt((Math.random() * pool.length) | 0);
+    },
+
+    // Mostly toggle letter case (A↔a); ~8% of the time draw a symbol
+    // from `swapSymbols`. Non-letters always draw a symbol. Closer to the
+    // Pudgy Penguins reference effect — feels typographic, not glitchy.
+    caseFlip(originalChar, opts) {
+      if (Math.random() < 0.08) return pickSymbol(opts);
+      const lower = originalChar.toLowerCase();
+      const upper = originalChar.toUpperCase();
+      if (lower !== upper) return originalChar === upper ? lower : upper;
+      return pickSymbol(opts);
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════
+  //  Color — parse "#rgb" / "#rrggbb" / "rgb(...)" / "rgba(...)" → [r,g,b]
+  // ════════════════════════════════════════════════════════════════════
+
+  const Color = {
+    parse(str) {
+      if (!str) return [255, 255, 255];
+      if (str.charAt(0) === '#') {
+        let hex = str.slice(1);
+        if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+        if (hex.length === 6) {
+          const n = parseInt(hex, 16);
+          if (!isNaN(n)) return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+        }
+      }
+      const m = str.match(/(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)[^\d.]+(\d+(?:\.\d+)?)/);
+      if (m) return [+m[1] | 0, +m[2] | 0, +m[3] | 0];
+      return [255, 255, 255];
+    },
+  };
 
   // ════════════════════════════════════════════════════════════════════
   //  Splitter — text → Char[].
@@ -1764,10 +1740,6 @@
     className:   'tr-char',     // base class for char spans
   };
 
-  // Frozen rest target — returned when a char has no active influence so
-  // the integrators have a known-zero state without per-char allocation.
-  const REST = Object.freeze({ tx: 0, ty: 0, rot: 0, scale: 1, brightness: 0, scramble: 0, interior: false });
-
   // ════════════════════════════════════════════════════════════════════
   //  TextRippling — public façade.
   //
@@ -2086,71 +2058,44 @@
     return typeof name === 'function' ? name : (registry[name] || fallback);
   }
 
-  // ════════════════════════════════════════════════════════════════════
-  //  Convenience + exports
-  // ════════════════════════════════════════════════════════════════════
-
   function rippleAll(selector, options) {
     return Array.from(document.querySelectorAll(selector))
       .map((el) => new TextRippling(el, options));
   }
 
-  // Attach registries and helpers to the constructor for plugin authors.
-  TextRippling.version      = VERSION;
-  TextRippling.effects      = Effects;
-  TextRippling.falloffs     = Falloffs;
-  TextRippling.glyphPickers = GlyphPickers;
-  TextRippling.rippleAll    = rippleAll;
-  // Cursor field is exposed for advanced use: custom effects can read
-  // history (cursor.state.stamps), and tests / alternative input sources
-  // can push state.x/y and call cursor.update(now) directly.
-  TextRippling.cursor       = CursorField;
-  // Ripple physics module is exposed so it can be used standalone — pass
-  // any (charX, charY, time, stamps[, ...]) and get back wake amplitude,
-  // independent of the rest of the framework.
-  TextRippling.ripple       = Ripple;
-  // WordReveal is the shared word-level activation/animation orchestrator
-  // used by both reveal modes. Plugin authors can call its helpers
-  // directly to drive custom reveal behavior on the per-word state
-  // (c.wordState) that Splitter populates.
-  TextRippling.wordReveal   = WordReveal;
-  // RevealLayer is exposed for plugin authors that want to drive layer
-  // assignment manually (skipping `revealText` / `data-reveal`) by
-  // writing `c.revealChar` directly. Public API: .frame(chars, ctx, opts).
-  TextRippling.revealLayer  = RevealLayer;
-  // WaveReveal is exposed similarly — public API: .frame(chars, ctx, opts)
-  // for the wave-driven reversible reveal mode.
-  TextRippling.waveReveal   = WaveReveal;
-  // BloomRipple — public API: .frame(chars, ctx, opts) for the wave-driven
-  // sticky bloom that pairs with effect: 'ripple' for styled revealed text.
-  TextRippling.bloomRipple  = BloomRipple;
-  // BurnReveal — public API: .frame(chars, ctx, opts) for the paper-burn
-  // reveal ('burn' mode); .attach(chars, opts) re-masks and resets the
-  // burn state (a fresh sheet of paper).
-  TextRippling.burnReveal   = BurnReveal;
-  // Redact is exposed for plugin authors that want to drive the
-  // stochastic block redaction directly (skip Effects.redact dispatch).
-  TextRippling.redact       = Redact;
+  // This object is the single source of truth for constructor attachments,
+  // CommonJS properties, and generated ESM named exports. Key order is part
+  // of the established CommonJS constructor shape and must remain stable.
+  const PUBLIC_API = {
+    version: VERSION,
+    effects: Effects,
+    falloffs: Falloffs,
+    glyphPickers: GlyphPickers,
+    rippleAll,
+    cursor: CursorField,
+    ripple: Ripple,
+    wordReveal: WordReveal,
+    revealLayer: RevealLayer,
+    waveReveal: WaveReveal,
+    bloomRipple: BloomRipple,
+    burnReveal: BurnReveal,
+    redact: Redact,
+  };
+
+  Object.assign(TextRippling, PUBLIC_API);
+
+  const root = typeof window !== 'undefined' ? window : globalThis;
 
   // Browser global (works under <script src> from file:// or http://).
   if (typeof root !== 'undefined') root.TextRippling = TextRippling;
 
-  // CommonJS (Node, bundlers).
+  // CommonJS (Node, bundlers). Assigning PUBLIC_API after TextRippling keeps
+  // module.exports.TextRippling identical to the constructor while retaining
+  // the constructor's established static-property insertion order.
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = TextRippling;
-    module.exports.TextRippling  = TextRippling;
-    module.exports.rippleAll     = rippleAll;
-    module.exports.effects       = Effects;
-    module.exports.falloffs      = Falloffs;
-    module.exports.glyphPickers  = GlyphPickers;
-    module.exports.cursor        = CursorField;
-    module.exports.ripple        = Ripple;
-    module.exports.wordReveal    = WordReveal;
-    module.exports.revealLayer   = RevealLayer;
-    module.exports.waveReveal    = WaveReveal;
-    module.exports.bloomRipple   = BloomRipple;
-    module.exports.burnReveal    = BurnReveal;
-    module.exports.redact        = Redact;
-    module.exports.version       = VERSION;
+    module.exports.TextRippling = TextRippling;
+    Object.assign(module.exports, PUBLIC_API);
   }
-}(typeof window !== 'undefined' ? window : globalThis));
+
+})();

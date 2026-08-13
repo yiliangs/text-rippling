@@ -27,9 +27,14 @@
     "effect"
   ],
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "check:generated": "node scripts/build.mjs --check",
     "dev": "npx --yes serve . -l 5173",
     "start": "npx --yes serve . -l 5173",
-    "test": "node --test"
+    "test": "npm run check:generated && node --test"
+  },
+  "devDependencies": {
+    "rollup": "4.62.3"
   },
   "license": "MIT"
 }
