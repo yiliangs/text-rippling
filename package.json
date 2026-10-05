@@ -1,6 +1,6 @@
 {
   "name": "text-rippling",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Mouse-reactive per-character text effects for the web. Zero dependencies.",
   "main": "src/text-rippling.js",
   "module": "src/text-rippling.mjs",

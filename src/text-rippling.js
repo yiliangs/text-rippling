@@ -1,5 +1,5 @@
 // text-rippling — mouse-reactive per-character text effects.
-// v0.1.0  •  zero dependencies  •  single-file classic script
+// v0.2.0  •  zero dependencies  •  single-file classic script
 //
 // Drop in via <script src="text-rippling.js"></script> and use the global
 // `TextRippling` constructor. Also exposes CommonJS exports for Node /
@@ -44,7 +44,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.2.0';
 
   // Reference frame interval (≈60Hz) — the rate the per-step integrator
   // constants in DEFAULTS are tuned for. The dt-aware integrators rescale
@@ -136,6 +136,14 @@
     compute(charX, charY, time, stamps, speed, spatial, postHit, edge) {
       if (!stamps || stamps.length === 0) return null;
 
+      // Squared-distance gate: amplAtHit = exp(-dd/spatial) falls below
+      // the 0.02 contribution floor whenever dd > spatial·ln(50) ≈
+      // spatial·3.912. Same threshold as the amplAtHit check below,
+      // hoisted to the cheap side of the math so far stamps skip the
+      // sqrt + exp entirely.
+      const cutoff = spatial * 3.912;
+      const cutoff2 = cutoff * cutoff;
+
       let brightness = 0;
       let frontierAmp = 0;
       let interior = false;
@@ -144,7 +152,9 @@
         const s = stamps[i];
         const ddx = charX - s.x;
         const ddy = charY - s.y;
-        const dd = Math.sqrt(ddx * ddx + ddy * ddy);
+        const dd2 = ddx * ddx + ddy * ddy;
+        if (dd2 >= cutoff2) continue;
+        const dd = Math.sqrt(dd2);
 
         const amplAtHit = Math.exp(-dd / spatial);
         if (amplAtHit < 0.02) continue;
@@ -653,6 +663,7 @@
       c.burnedAt = 0;
       c.maskGlyph = null;
       c.nextTwinkle = 0;
+      c._heatPainted = -1;   // burnColorWriter's last-written heat (write gating)
     },
 
     // (Re)start the mode: reset burn state and mask every char NOW —
@@ -665,6 +676,7 @@
         c.revealed = false;
         c.maskGlyph = burnMaskGlyph(opts.glyphPool, null);
         c.nextTwinkle = 0; // frame() staggers the first re-roll
+        c._heatPainted = -1;
         c.textEl.textContent = c.maskGlyph;
       }
     },
@@ -681,6 +693,7 @@
           c.burnHeat = 0;
           c.burnedAt = 0;
           c.revealed = false;
+          c._heatPainted = -1;
         }
       }
     },
@@ -1048,7 +1061,11 @@
 
   const GlyphPickers = {
     // Uniform random pick from `glyphPool`. Matrix-style chaos.
+    // Whitespace never scrambles (relevant in splitLines mode, where
+    // spaces are real chars): a flashing space is typographic noise,
+    // and burn mode needs revealed spaces to stay burned-away blank.
     pool(originalChar, opts) {
+      if (/\s/.test(originalChar)) return null;
       const pool = opts.glyphPool;
       if (!pool || pool.length === 0) return null;
       return pool.charAt((Math.random() * pool.length) | 0);
@@ -1057,7 +1074,9 @@
     // Mostly toggle letter case (A↔a); ~8% of the time draw a symbol
     // from `swapSymbols`. Non-letters always draw a symbol. Closer to the
     // Pudgy Penguins reference effect — feels typographic, not glitchy.
+    // Whitespace never scrambles (same rationale as `pool` above).
     caseFlip(originalChar, opts) {
+      if (/\s/.test(originalChar)) return null;
       if (Math.random() < 0.08) return pickSymbol(opts);
       const lower = originalChar.toLowerCase();
       const upper = originalChar.toUpperCase();
@@ -1087,15 +1106,17 @@
   const CursorField = (() => {
     const STAMP_MIN_DIST = 5;
     const STAMP_MIN_DIST_SQ = STAMP_MIN_DIST * STAMP_MIN_DIST;
-    const STAMP_MAX_AGE = 2000;
+    // A stamp 1.2s old has its wavefront ~660px out (speed 0.55 px/ms),
+    // where amplAtHit = exp(-660/180) ≈ 0.026 — right at the 0.02
+    // contribution floor. Everything older is invisible, so age it out.
+    const STAMP_MAX_AGE = 1200;
     // Cap on stamps in flight. With STAMP_MIN_DIST=5 and a fast continuous
     // stroke (~16 px/frame at 60Hz), one stamp drops per frame; over the
-    // 2s STAMP_MAX_AGE window that's ~120 stamps. Capping at 100 truncates
-    // the oldest tail, which is below the 0.02 amplitude floor anyway
-    // (a stamp 1.3s old contributes ~0.019 brightness at the wavefront —
-    // imperceptible). Per-char Ripple.compute is O(stamps), so this cap
-    // is a direct multiplier on every consumer's hot loop.
-    const STAMP_BUFFER_CAP = 100;
+    // 1.2s STAMP_MAX_AGE window that's ~72 stamps. Capping at 60 truncates
+    // an oldest tail that is already below the amplitude floor. Per-char
+    // Ripple.compute is O(stamps), so this cap is a direct multiplier on
+    // every consumer's hot loop.
+    const STAMP_BUFFER_CAP = 60;
 
     const state = {
       x: -1e6, y: -1e6,
@@ -1221,11 +1242,30 @@
   // ════════════════════════════════════════════════════════════════════
   //  Splitter — text → Char[].
   //
-  //  Whitespace is normalized (collapsed runs, trimmed) so indented HTML
-  //  source doesn't bleed visible leading space. Each whole word is
-  //  wrapped in an inline-block to prevent mid-word breaks. Each char
-  //  becomes its own animatable inline-block span. Inter-word spaces
-  //  are plain text nodes so the browser collapses them at line wraps.
+  //  Two layout modes, selected by `opts.splitLines`:
+  //
+  //  WORD MODE (default). Whitespace is normalized (collapsed runs,
+  //  trimmed) so indented HTML source doesn't bleed visible leading
+  //  space. Each whole word is wrapped in an inline-block to prevent
+  //  mid-word breaks. Each char becomes its own animatable inline-block
+  //  span. Inter-word spaces are plain text nodes so the browser
+  //  collapses them at line wraps.
+  //
+  //  LINE MODE (`splitLines: true`). For preformatted / monospace
+  //  content where the newline structure IS the layout (ASCII documents,
+  //  terminal-style screens). '\n' becomes a hard row break — each line
+  //  is a block-level `<div class="tr-char-line">` with `white-space:
+  //  pre` and no word wrapping; the caller owns line lengths. All other
+  //  whitespace is preserved verbatim, and every SPACE gets its own
+  //  char span, so cover-based modes (burn's procedural mask, redact)
+  //  blanket the full field instead of leaking word shapes through the
+  //  gaps. Runs of non-space chars still share a word-state record
+  //  (spaces get a private single-char record), so word-level reveal
+  //  modes keep working unchanged. Empty lines keep their row height
+  //  via a bare NBSP text node (not a char — nothing to animate).
+  //  Whitespace chars never scramble (see GlyphPickers) — a flashing
+  //  space is typographic noise, and in burn mode a revealed space
+  //  must stay burned-away blank.
   //
   //  Each char span is a TWO-LAYER host so per-glyph effects that would
   //  otherwise resize the slot (the redact bar in particular, but also
@@ -1247,6 +1287,74 @@
 
   const Splitter = {
     split(element, opts) {
+      return opts.splitLines
+        ? Splitter._splitLines(element, opts)
+        : Splitter._splitWords(element, opts);
+    },
+
+    // Build one two-layer char span (see banner above `_splitWords`).
+    // Shared by both layout modes so the Char DOM contract lives in
+    // exactly one place.
+    _makeCharSpan(ch, opts, coverBg) {
+      const span = document.createElement('span');
+      span.className = opts.className;
+      span.style.display = 'inline-block';
+      span.style.position = 'relative';
+      // will-change promotes each span to its own compositor layer —
+      // right for word mode's transform-heavy effects on short strings,
+      // ruinous for line mode's documents (thousands of mostly-idle
+      // layers exhaust compositor memory and stall pointer latency).
+      if (!opts.splitLines) span.style.willChange = 'transform';
+
+      const textEl = document.createElement('span');
+      textEl.className = opts.className + '-text';
+      textEl.textContent = ch;
+      span.appendChild(textEl);
+
+      const coverEl = document.createElement('span');
+      coverEl.className = opts.className + '-cover';
+      coverEl.style.position = 'absolute';
+      coverEl.style.left = '0';
+      coverEl.style.top = '0';
+      coverEl.style.right = '0';
+      coverEl.style.bottom = '0';
+      coverEl.style.background = coverBg;
+      coverEl.style.display = 'none';
+      coverEl.style.pointerEvents = 'none';
+      span.appendChild(coverEl);
+
+      return Char.create(span, ch, textEl, coverEl);
+    },
+
+    // Build one word: an inline-block wrapper of char spans sharing a
+    // single word-state record (see WordReveal banner). Appends to
+    // `parent`, pushes each Char onto `chars`.
+    _makeWord(tok, parent, chars, opts, coverBg) {
+      const word = document.createElement('span');
+      word.className = opts.className + '-word';
+      word.style.display = 'inline-block';
+      word.style.whiteSpace = 'nowrap';
+      // Track this word's chars so we can stamp word membership onto
+      // each Char after the word is fully built. The same array is
+      // referenced from every member, so word-local lookups are O(1).
+      const wordChars = [];
+      for (const ch of Array.from(tok)) {
+        const c = Splitter._makeCharSpan(ch, opts, coverBg);
+        c.indexInWord = wordChars.length;
+        wordChars.push(c);
+        chars.push(c);
+        word.appendChild(c.el);
+      }
+      // After the word is built, create a single shared per-word
+      // state record and attach it to every member char. Both
+      // RevealLayer and WaveReveal read state from this object via
+      // `c.wordState` rather than tracking per-char animation timers.
+      const wordState = WordReveal.makeWord(wordChars);
+      for (let i = 0; i < wordChars.length; i++) wordChars[i].wordState = wordState;
+      parent.appendChild(word);
+    },
+
+    _splitWords(element, opts) {
       const text = element.textContent.replace(/\s+/g, ' ').replace(/^ | $/g, '');
       element.textContent = '';
       const frag = document.createDocumentFragment();
@@ -1259,51 +1367,51 @@
           frag.appendChild(document.createTextNode(' '));
           continue;
         }
-        const word = document.createElement('span');
-        word.className = opts.className + '-word';
-        word.style.display = 'inline-block';
-        word.style.whiteSpace = 'nowrap';
-        // Track this word's chars so we can stamp word membership onto
-        // each Char after the word is fully built. The same array is
-        // referenced from every member, so word-local lookups are O(1).
-        const wordChars = [];
-        for (const ch of Array.from(tok)) {
-          const span = document.createElement('span');
-          span.className = opts.className;
-          span.style.display = 'inline-block';
-          span.style.position = 'relative';
-          span.style.willChange = 'transform';
+        Splitter._makeWord(tok, frag, chars, opts, coverBg);
+      }
+      element.appendChild(frag);
+      return chars;
+    },
 
-          const textEl = document.createElement('span');
-          textEl.className = opts.className + '-text';
-          textEl.textContent = ch;
-          span.appendChild(textEl);
+    // LINE MODE — see the Splitter banner. '\n' = hard row break; all
+    // other whitespace preserved verbatim; every space is its own char
+    // span (privately worded) so covers blanket the full field.
+    _splitLines(element, opts) {
+      const raw = element.textContent
+        .replace(/\r\n?/g, '\n')
+        .replace(/^\n+|\s+$/g, '');
+      element.textContent = '';
+      const frag = document.createDocumentFragment();
+      const chars = [];
+      const coverBg = opts.redactColor || 'currentColor';
 
-          const coverEl = document.createElement('span');
-          coverEl.className = opts.className + '-cover';
-          coverEl.style.position = 'absolute';
-          coverEl.style.left = '0';
-          coverEl.style.top = '0';
-          coverEl.style.right = '0';
-          coverEl.style.bottom = '0';
-          coverEl.style.background = coverBg;
-          coverEl.style.display = 'none';
-          coverEl.style.pointerEvents = 'none';
-          span.appendChild(coverEl);
-
-          word.appendChild(span);
-          const c = Char.create(span, ch, textEl, coverEl);
-          c.indexInWord = wordChars.length;
-          wordChars.push(c);
-          chars.push(c);
+      for (const lineText of raw.split('\n')) {
+        const line = document.createElement('div');
+        line.className = opts.className + '-line';
+        line.style.whiteSpace = 'pre';
+        if (lineText.length === 0) {
+          // Keep the empty row's height without minting an animatable
+          // char — there is nothing to mask or reveal on a blank line.
+          line.appendChild(document.createTextNode(' '));
+          frag.appendChild(line);
+          continue;
         }
-        // After the word is built, create a single shared per-word
-        // state record and attach it to every member char. Both
-        // RevealLayer and WaveReveal read state from this object via
-        // `c.wordState` rather than tracking per-char animation timers.
-        const wordState = WordReveal.makeWord(wordChars);
-        for (let i = 0; i < wordChars.length; i++) wordChars[i].wordState = wordState;
-        frag.appendChild(word);
+        for (const tok of lineText.match(/\S+|\s+/g)) {
+          if (/^\s/.test(tok)) {
+            // Whitespace run: one span per space, each its own one-char
+            // "word" so word-level reveal modes see a uniform contract
+            // (every char has a non-null wordState).
+            for (const ch of Array.from(tok)) {
+              const c = Splitter._makeCharSpan(ch, opts, coverBg);
+              c.wordState = WordReveal.makeWord([c]);
+              chars.push(c);
+              line.appendChild(c.el);
+            }
+          } else {
+            Splitter._makeWord(tok, line, chars, opts, coverBg);
+          }
+        }
+        frag.appendChild(line);
       }
       element.appendChild(frag);
       return chars;
@@ -1641,13 +1749,23 @@
   function burnColorWriter(c, x) {
     if (!c.revealed) {
       if (c.burnHeat > 0.01) {
-        writeLitColor(c.el, c.burnHeat, x.baseRgb, x.emberRgb, x.emberStr);
+        // Gate style writes to perceptible heat deltas: the heat field
+        // integrates every frame, but a slow smolder front moves heat
+        // ~0.006/frame — rewriting color + textShadow for every warm
+        // char every frame is the largest style-recalc source on a
+        // broad burn. A <0.02 change doesn't survive the color math.
+        const dh = c.burnHeat - c._heatPainted;
+        if (dh > 0.02 || dh < -0.02) {
+          writeLitColor(c.el, c.burnHeat, x.baseRgb, x.emberRgb, x.emberStr);
+          c._heatPainted = c.burnHeat;
+        }
         c.wasLit = true;
         c.colorPinned = true;
       } else if (c.wasLit || c.colorPinned) {
         // Cooled back to cover — drop inline styles so CSS color shows.
         c.el.style.color = '';
         c.el.style.textShadow = '';
+        c._heatPainted = -1;
         c.wasLit = false;
         c.colorPinned = false;
       }
@@ -1682,11 +1800,22 @@
   function scrambleAlways() { return true; }
   function scrambleRevealedOnly(c) { return c.revealed; }
 
+  // Per-mode effect-idle gates. A mode whose renderer provably ignores
+  // the effect output for a class of chars declares it here, and _tick
+  // skips the (potentially O(stamps)) effect evaluation for them. Burn:
+  // an unrevealed char takes its color from the heat field and its
+  // scramble gate is closed (scrambleRevealedOnly), so ripple output is
+  // dead weight until the char burns through — on a fresh page that is
+  // every char, which turns the global-effect hot loop from O(chars ×
+  // stamps) into ~zero.
+  function effectIdleNever() { return false; }
+  function effectIdleUnrevealed(c) { return !c.revealed; }
+
   const REVEAL_MODES = {
-    'cursor':       { frame: RevealLayer.frame, colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
-    'wave':         { frame: WaveReveal.frame,  colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
-    'bloom-ripple': { frame: BloomRipple.frame, colorWriter: bloomColorWriter,   naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways },
-    'burn':         { frame: BurnReveal.frame,  colorWriter: burnColorWriter,    naturalGlyph: burnNaturalGlyph,    scrambleOk: scrambleRevealedOnly },
+    'cursor':       { frame: RevealLayer.frame, colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways,       effectIdle: effectIdleNever },
+    'wave':         { frame: WaveReveal.frame,  colorWriter: defaultColorWriter, naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways,       effectIdle: effectIdleNever },
+    'bloom-ripple': { frame: BloomRipple.frame, colorWriter: bloomColorWriter,   naturalGlyph: defaultNaturalGlyph, scrambleOk: scrambleAlways,       effectIdle: effectIdleNever },
+    'burn':         { frame: BurnReveal.frame,  colorWriter: burnColorWriter,    naturalGlyph: burnNaturalGlyph,    scrambleOk: scrambleRevealedOnly, effectIdle: effectIdleUnrevealed },
   };
 
   // ════════════════════════════════════════════════════════════════════
@@ -1760,6 +1889,8 @@
     redactColor:        '',     // CSS color for the redact bar; '' falls back to currentColor (inherits text color)
     // Layout / DOM
     splitWords:  true,          // wrap whole words in inline-block (prevents mid-word wrap)
+    splitLines:  false,         // line mode: '\n' = hard row break, spaces become char spans,
+                                // no word wrap — for preformatted/monospace content (see Splitter)
     remeasureOn: 'auto',        // 'auto' | 'manual'
     className:   'tr-char',     // base class for char spans
   };
@@ -1966,6 +2097,7 @@
       const colorWriter = modeBundle ? modeBundle.colorWriter  : defaultColorWriter;
       const naturalOf   = modeBundle ? modeBundle.naturalGlyph : defaultNaturalGlyph;
       const scrambleOk  = modeBundle ? modeBundle.scrambleOk   : scrambleAlways;
+      const effectIdle  = modeBundle ? modeBundle.effectIdle   : effectIdleNever;
 
       // Per-frame color context — resolve endpoints once so the per-char
       // writer doesn't have to re-check this._revealCache for every glyph.
@@ -1984,7 +2116,9 @@
       };
 
       for (const c of this._chars) {
-        const target = evalCharTarget(c, ctx, effect, falloff, opts, isGlobal, rCutoffSq);
+        const target = effectIdle(c)
+          ? REST
+          : evalCharTarget(c, ctx, effect, falloff, opts, isGlobal, rCutoffSq);
 
         Char.springStep(c, target.tx || 0, target.ty || 0, target.rot || 0,
                         typeof target.scale === 'number' ? target.scale : 1,
